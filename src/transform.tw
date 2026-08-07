@@ -1,0 +1,371 @@
+mode systems
+
+# transform.tw: constrained parameters, and the Jacobian term that makes them
+# honest.
+#
+# THE PROBLEM
+#
+# A Hamiltonian sampler moves in unconstrained real space. Half the parameters
+# anyone cares about are not in unconstrained real space: a scale is positive,
+# a probability is in (0, 1), a mixture weight vector is on the simplex, a cut
+# point vector is ordered. Rejecting every proposal that leaves the support
+# works and is terrible: the acceptance rate collapses near the boundary, which
+# is exactly where the posterior mass often is.
+#
+# The fix is to sample an unconstrained x and define the constrained parameter
+# as y = f(x) for a smooth bijection f. The sampler never sees a boundary,
+# because f pushes it to infinity.
+#
+# THE PART THAT IS EASY TO GET SILENTLY WRONG
+#
+# Changing variables changes the density. If y has density p(y) and y = f(x),
+# then the density of x is
+#
+#   p_x(x) = p_y(f(x)) * |det J_f(x)|
+#
+# so the log density the sampler must be handed is
+#
+#   log p_y(f(x)) + log|det J_f(x)|
+#
+# Drop that second term and nothing breaks. There is no error, no warning, no
+# divergence, no failed diagnostic. The sampler runs happily and returns a
+# posterior that is wrong, biased toward whichever end of the constrained space
+# the transform compresses. For the log transform that means a systematically
+# small scale parameter, which is the single most common silent defect in
+# hand-rolled Bayesian code.
+#
+# So every transform in this file comes in three parts, and the third is not
+# optional:
+#
+#   forward(x)      the unconstrained point mapped into the constrained space
+#   inverse(y)      the constrained point mapped back, for placing an initial
+#                   value or reporting
+#   log_jac(x)      log|det J| of the forward map at x
+#
+# Each `log_jac` below carries the derivation. That is not documentation for
+# its own sake. A reader who cannot check the Jacobian cannot check the
+# posterior, and the posterior is the only output.
+#
+# WHY THESE ARE TENSOR FUNCTIONS
+#
+# The transform is part of the log density, so it sits inside the function
+# `grad` differentiates. It is written on tensors for that reason and for no
+# other. `src/vec.tw` explains the seam.
+
+import "std/nn" as nn
+
+# ---- numerically careful helpers -------------------------------------------
+
+# log(1 + exp(x)), without overflowing for large x or losing everything for
+# very negative x.
+#
+# `std/nn.tw` has a `softplus` and it is the naive `log(1.0 + exp(x))`, which
+# is +inf by x = 710 and loses all precision by x = -37. Both ends are reached
+# by a real sampler: an unconstrained scale wanders to +-40 routinely during
+# warmup, and an infinity in the Jacobian term poisons the whole trajectory.
+#
+# The identity is softplus(x) = max(x, 0) + log(1 + exp(-|x|)), where the
+# exponent is never positive so the exponential is never larger than 1.
+fn softplus(x: Tensor) -> Tensor =
+  maximum(x, 0.0) + log(1.0 + exp(0.0 - abs(x)))
+
+# log(sigmoid(x)) = -softplus(-x). Written through softplus rather than as
+# log(sigmoid(x)) because sigmoid underflows to exactly 0 around x = -746 and
+# the log of that is -inf, while -softplus(-x) is just -x there and correct.
+fn log_sigmoid(x: Tensor) -> Tensor = 0.0 - softplus(0.0 - x)
+
+# log(1 - sigmoid(x)) = log(sigmoid(-x)) = -softplus(x). Same argument at the
+# other end.
+fn log_one_minus_sigmoid(x: Tensor) -> Tensor = 0.0 - softplus(x)
+
+# ---- positive: the log transform -------------------------------------------
+#
+#   y = exp(x),  x in R,  y in (0, inf)
+#
+# dy/dx = exp(x) = y, so log|dy/dx| = x. Elementwise, so for a vector the log
+# determinant of the diagonal Jacobian is the sum of the x's.
+#
+# This is the one everyone forgets. A half-normal prior on a scale, sampled on
+# the log scale without the `+ sum(x)` term, gives a posterior for the scale
+# that is too small by roughly a factor related to the posterior's own spread.
+# It looks like a tighter fit, which is why it survives review.
+
+fn positive_forward(x: Tensor) -> Tensor = exp(x)
+
+fn positive_inverse(y: Tensor) -> Tensor = log(y)
+
+fn positive_log_jac(x: Tensor) -> Tensor = sum(x)
+
+# ---- lower bounded: shifted log ---------------------------------------------
+#
+#   y = a + exp(x),  y in (a, inf)
+#
+# The shift is constant, so dy/dx is unchanged and the Jacobian is the same.
+# Kept as its own function anyway, because a caller who writes
+# `positive_forward(x) + a` and then reuses `positive_log_jac` is right by
+# accident, and a caller who writes `a * exp(x)` and reuses it is wrong.
+
+fn lower_forward(x: Tensor, a: F64) -> Tensor = a + exp(x)
+
+fn lower_inverse(y: Tensor, a: F64) -> Tensor = log(y - a)
+
+fn lower_log_jac(x: Tensor) -> Tensor = sum(x)
+
+# ---- upper bounded ----------------------------------------------------------
+#
+#   y = b - exp(x),  y in (-inf, b)
+#
+# dy/dx = -exp(x). The determinant is negative and the transform uses its
+# absolute value, which is exp(x) again, so the term is the same sum. This is
+# why the rule is |det J| and not det J, and it is the reason the sign of a
+# decreasing transform never appears in a correct implementation.
+
+fn upper_forward(x: Tensor, b: F64) -> Tensor = b - exp(x)
+
+fn upper_inverse(y: Tensor, b: F64) -> Tensor = log(b - y)
+
+fn upper_log_jac(x: Tensor) -> Tensor = sum(x)
+
+# ---- the unit interval: the logit transform ---------------------------------
+#
+#   y = sigmoid(x),  y in (0, 1)
+#
+# dy/dx = sigmoid(x) * (1 - sigmoid(x)), so
+#
+#   log|dy/dx| = log sigmoid(x) + log(1 - sigmoid(x))
+#              = -softplus(-x) - softplus(x)
+#
+# The second line is what is computed. The first line underflows at both tails:
+# at x = -800 sigmoid(x) is 0 and its log is -inf, and the sampler receives a
+# -inf log density for a point that is perfectly ordinary in unconstrained
+# space. The stable form is finite everywhere and equals -|x| plus a small
+# correction, which is the right asymptotic.
+
+fn unit_forward(x: Tensor) -> Tensor = sigmoid(x)
+
+fn unit_inverse(y: Tensor) -> Tensor = log(y) - log(1.0 - y)
+
+fn unit_log_jac(x: Tensor) -> Tensor =
+  sum(log_sigmoid(x) + log_one_minus_sigmoid(x))
+
+# ---- a bounded interval -----------------------------------------------------
+#
+#   y = a + (b - a) * sigmoid(x),  y in (a, b)
+#
+# dy/dx = (b - a) * sigmoid(x) * (1 - sigmoid(x)), so the log determinant is
+# the unit-interval term plus n * log(b - a) for an n-vector. The width term is
+# constant in x and therefore has no gradient, but it is not droppable: it is
+# constant in x for a *fixed* interval, and a hierarchical model whose bounds
+# are themselves parameters would see it move. Keeping it means the log density
+# is a real log density rather than one up to a constant, and the marginal
+# likelihood estimates in `src/advi.tw` depend on that.
+
+fn interval_forward(x: Tensor, a: F64, b: F64) -> Tensor =
+  a + (b - a) * sigmoid(x)
+
+fn interval_inverse(y: Tensor, a: F64, b: F64) -> Tensor {
+  let z: Tensor = (y - a) / (b - a)
+  log(z) - log(1.0 - z)
+}
+
+fn interval_log_jac(x: Tensor, a: F64, b: F64, n: I64) -> Tensor =
+  unit_log_jac(x) + f64_of_i64(n) * f64_log(b - a)
+
+# ---- the simplex: stick breaking --------------------------------------------
+#
+#   x in R^(K-1)  ->  y in the K-simplex, y_k > 0, sum y = 1
+#
+# K-1 unconstrained numbers, not K. A K-vector that sums to one has K-1 degrees
+# of freedom, and a transform from R^K would be singular: its Jacobian would
+# not be square and the density would not exist. Sampling K unconstrained
+# values for a K-simplex is a real mistake people make, and the symptom is a
+# posterior with an unidentified direction that the sampler wanders along
+# forever while R-hat refuses to converge.
+#
+# The construction, Stan's, breaks a stick of length 1:
+#
+#   z_k = sigmoid(x_k + log(1 / (K - k)))         for k = 1..K-1
+#   y_k = (1 - sum_{i<k} y_i) * z_k
+#   y_K = 1 - sum_{i<K} y_i
+#
+# The offset log(1/(K-k)) is not decoration. Without it, x = 0 maps to the
+# corner-heavy point (1/2, 1/4, 1/8, ...) rather than to the centre of the
+# simplex, so an uninformative starting point is already an opinion. With it,
+# x = 0 maps to the uniform point (1/K, ..., 1/K).
+#
+# THE JACOBIAN
+#
+# The map is lower triangular in the ordering (x_1 -> y_1, then x_2 -> y_2, and
+# so on), because y_k depends only on x_1..x_k. The determinant of a triangular
+# Jacobian is the product of its diagonal, and
+#
+#   dy_k/dx_k = r_k * z_k * (1 - z_k)
+#
+# where r_k = 1 - sum_{i<k} y_i is the stick remaining before step k. So
+#
+#   log|det J| = sum_k [ log z_k + log(1 - z_k) + log r_k ]
+#
+# The first two terms are the logit Jacobian and are computed stably as before.
+# The third is the one that is unique to stick breaking and the one that gets
+# left out, because it does not appear in any single-parameter transform. Left
+# out, the posterior is pushed toward the simplex corners.
+#
+# `r_k` is accumulated in the same loop that builds y, so the value used in the
+# Jacobian is exactly the value used in the forward map. Recomputing it
+# separately is how the two drift apart under a later edit.
+
+struct Simplex {
+  y: Tensor,
+  log_jac: Tensor,
+}
+
+fn simplex(x: Tensor, k: I64) -> Simplex {
+  let pieces: Arr[Tensor] = []
+  let remaining: Tensor = scalar(1.0)
+  let lj: Tensor = scalar(0.0)
+
+  let i: I64 = 0
+  while i < k - 1 {
+    # The offset that centres x = 0 on the uniform point.
+    let offset: F64 = 0.0 - f64_log(f64_of_i64(k - 1 - i))
+    let xi: Tensor = x[i] + offset
+    let z: Tensor = sigmoid(xi)
+    let yi: Tensor = remaining * z
+
+    lj = lj + log_sigmoid(xi) + log_one_minus_sigmoid(xi) + log(remaining)
+
+    push(pieces, reshape(yi, 1))
+    remaining = remaining - yi
+    i = i + 1
+  }
+
+  # The last component is whatever is left. It is not transformed and
+  # contributes no Jacobian term, which is the whole reason there are only
+  # K-1 unconstrained coordinates.
+  push(pieces, reshape(remaining, 1))
+
+  Simplex { y: concat_tensors(pieces, 0), log_jac: lj }
+}
+
+# The inverse, for placing an initial point or reporting a constrained draw.
+# It runs the same recursion forward on y, which is cheaper and less
+# error-prone than deriving a closed form and lets the two share the offset.
+fn simplex_inverse(y: Tensor, k: I64) -> Tensor {
+  let pieces: Arr[Tensor] = []
+  let remaining: F64 = 1.0
+
+  let i: I64 = 0
+  while i < k - 1 {
+    let yi: F64 = item(y[i])
+    let z: F64 = yi / remaining
+    let offset: F64 = 0.0 - f64_log(f64_of_i64(k - 1 - i))
+    let xi: F64 = f64_log(z) - f64_log(1.0 - z) - offset
+    push(pieces, reshape(scalar(xi), 1))
+    remaining = remaining - yi
+    i = i + 1
+  }
+
+  concat_tensors(pieces, 0)
+}
+
+# ---- ordered vectors --------------------------------------------------------
+#
+#   y_1 = x_1,  y_k = y_{k-1} + exp(x_k)
+#
+# For cut points in an ordinal model and for the component means of a mixture,
+# where ordering is what breaks the label-switching symmetry. Without it a
+# two-component mixture has two identical posterior modes that differ only by a
+# relabelling, and R-hat correctly reports that the chains disagree, and the
+# disagreement is not a convergence failure but an unidentified model.
+#
+# The Jacobian is again triangular. dy_1/dx_1 = 1 contributes nothing, and
+# dy_k/dx_k = exp(x_k) contributes x_k, so log|det J| is the sum of x_2..x_n.
+
+struct Ordered {
+  y: Tensor,
+  log_jac: Tensor,
+}
+
+fn ordered(x: Tensor, n: I64) -> Ordered {
+  let pieces: Arr[Tensor] = []
+  let cur: Tensor = x[0]
+  push(pieces, reshape(cur, 1))
+
+  let lj: Tensor = scalar(0.0)
+  let i: I64 = 1
+  while i < n {
+    cur = cur + exp(x[i])
+    push(pieces, reshape(cur, 1))
+    lj = lj + x[i]
+    i = i + 1
+  }
+
+  Ordered { y: concat_tensors(pieces, 0), log_jac: lj }
+}
+
+fn ordered_inverse(y: Tensor, n: I64) -> Tensor {
+  let pieces: Arr[Tensor] = []
+  push(pieces, reshape(y[0], 1))
+  let i: I64 = 1
+  while i < n {
+    push(pieces, reshape(log(y[i] - y[i - 1]), 1))
+    i = i + 1
+  }
+  concat_tensors(pieces, 0)
+}
+
+# ---- a Cholesky factor with a positive diagonal -----------------------------
+#
+# For a covariance parameterised as L L', L lower triangular. The
+# parameterisation is not unique unless the diagonal is pinned positive, and
+# without pinning it the posterior has 2^n reflected modes, one per sign
+# pattern, all identical. The sampler visits them and R-hat reports failure.
+#
+#   L_ii = exp(x_ii),  L_ij = x_ij for i > j
+#
+# The off-diagonal entries are the identity and contribute nothing. The
+# diagonal contributes sum of the diagonal x's, exactly as the positive
+# transform does, because the map is diagonal in those coordinates.
+#
+# `n` is the matrix dimension. `x` holds the n diagonal entries first, then the
+# n(n-1)/2 strictly lower entries in row-major order. Packing them into one
+# flat vector rather than taking two arguments is deliberate: the sampler works
+# on one flat unconstrained vector and any function that takes two slices of it
+# is a function whose caller must do the slicing arithmetic, which is where the
+# off-by-one lives.
+
+struct CholFactor {
+  l: Tensor,
+  log_jac: Tensor,
+}
+
+fn chol_factor(x: Tensor, n: I64) -> CholFactor {
+  let rows: Arr[Tensor] = []
+  let off: I64 = n
+
+  let i: I64 = 0
+  while i < n {
+    let cells: Arr[Tensor] = []
+    let j: I64 = 0
+    while j < n {
+      if j < i {
+        push(cells, reshape(x[off], 1))
+        off = off + 1
+      } else if j == i {
+        push(cells, reshape(exp(x[i]), 1))
+      } else {
+        push(cells, reshape(scalar(0.0), 1))
+      }
+      j = j + 1
+    }
+    push(rows, reshape(concat_tensors(cells, 0), 1, n))
+    i = i + 1
+  }
+
+  CholFactor { l: concat_tensors(rows, 0), log_jac: sum(x[0:n]) }
+}
+
+# The number of unconstrained coordinates a Cholesky factor of dimension n
+# needs. Exported because the caller sizes the sampler's state vector and
+# getting this wrong is a shape error a long way from here.
+fn chol_size(n: I64) -> I64 = n + n * (n - 1) / 2

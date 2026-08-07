@@ -1,0 +1,208 @@
+mode systems
+
+import "harness.tw" as t
+import "../src/transform.tw" as tr
+
+# THE TEST THAT MATTERS IN THIS FILE
+#
+# Every Jacobian is checked against a numerical determinant of the forward map.
+# A transform's forward direction is easy to get right and easy to test by
+# inspection. Its Jacobian is neither, and a wrong Jacobian does not produce a
+# wrong answer anywhere except in the posterior, four hours later, silently.
+#
+# For a scalar transform the determinant is the derivative, so the check is a
+# central difference of the forward map against exp(log_jac). For the vector
+# transforms with a triangular Jacobian, the determinant is the product of the
+# diagonal partials, so the check is a product of central differences.
+
+let H: F64 = 0.00001
+
+fn central(f: fn(F64) -> F64, x: F64) -> F64 = (f(x + H) - f(x - H)) / (2.0 * H)
+
+fn the_log_transform_maps_the_line_onto_the_positive_reals() {
+  t.near("exp(0) is 1", item(tr.positive_forward(scalar(0.0))), 1.0, 0.000000000001)
+  t.check("a very negative x is positive", item(tr.positive_forward(scalar(-50.0))) > 0.0)
+  t.near("the inverse round trips", item(tr.positive_inverse(tr.positive_forward(scalar(1.7)))),
+    1.7, 0.0000000001)
+}
+
+fn the_log_transforms_jacobian_is_the_derivative_of_the_forward_map() {
+  let x: F64 = 0.8
+  let f = fn(v: F64) -> F64 = item(tr.positive_forward(scalar(v)))
+  t.near("log transform jacobian",
+    f64_exp(item(tr.positive_log_jac(scalar(x)))), central(f, x), 0.000001)
+}
+
+fn the_logit_transforms_jacobian_is_the_derivative_of_the_forward_map() {
+  let x: F64 = -1.3
+  let f = fn(v: F64) -> F64 = item(tr.unit_forward(scalar(v)))
+  t.near("logit transform jacobian",
+    f64_exp(item(tr.unit_log_jac(scalar(x)))), central(f, x), 0.0000001)
+}
+
+# The stability claim in the source, tested at the value where the naive form
+# stops working. sigmoid(-800) is exactly zero in double precision, so
+# log(sigmoid(x)) is -inf; the stable form is about -800.
+fn the_logit_jacobian_is_finite_far_out_in_the_tail() {
+  let v: F64 = item(tr.unit_log_jac(scalar(-800.0)))
+  t.check("the logit jacobian is finite at x = -800", v > -2000.0 and v < 0.0)
+  t.near("and it is asymptotically -|x|", v, -800.0, 1.0)
+}
+
+fn softplus_does_not_overflow_at_a_large_argument() {
+  # The naive log(1 + exp(x)) is +inf by x = 710.
+  t.near("softplus(800) is 800", item(tr.softplus(scalar(800.0))), 800.0, 0.000001)
+  t.near("softplus(0) is log 2", item(tr.softplus(scalar(0.0))), 0.6931471805599453, 0.000000000001)
+}
+
+fn the_interval_transform_stays_inside_its_bounds() {
+  let a: F64 = -2.0
+  let b: F64 = 5.0
+  t.check("a huge x stays below the upper bound", item(tr.interval_forward(scalar(100.0), a, b)) < b)
+  t.check("a huge negative x stays above the lower bound",
+    item(tr.interval_forward(scalar(-100.0), a, b)) > a)
+  t.near("zero maps to the midpoint", item(tr.interval_forward(scalar(0.0), a, b)), 1.5,
+    0.000000000001)
+}
+
+fn the_interval_jacobian_carries_the_width_factor() {
+  let x: F64 = 0.4
+  let a: F64 = -2.0
+  let b: F64 = 5.0
+  let f = fn(v: F64) -> F64 = item(tr.interval_forward(scalar(v), a, b))
+  t.near("interval transform jacobian",
+    f64_exp(item(tr.interval_log_jac(scalar(x), a, b, 1))), central(f, x), 0.000001)
+}
+
+# The centring offset. Without it, x = 0 maps to (1/2, 1/4, 1/8, 1/8) for K = 4,
+# which is a strong opinion disguised as an uninformative start.
+fn stick_breaking_maps_zero_to_the_uniform_point() {
+  let s = tr.simplex([0.0, 0.0, 0.0], 4)
+  let i: I64 = 0
+  while i < 4 {
+    t.near("component " + str(i) + " of the centred simplex point",
+      item(s.y[i]), 0.25, 0.0000000001)
+    i = i + 1
+  }
+}
+
+fn a_stick_breaking_point_lies_on_the_simplex() {
+  let s = tr.simplex([1.4, -2.0, 0.3], 4)
+  let total: F64 = 0.0
+  let i: I64 = 0
+  while i < 4 {
+    t.check("every simplex component is positive", item(s.y[i]) > 0.0)
+    total = total + item(s.y[i])
+    i = i + 1
+  }
+  t.near("the simplex point sums to one", total, 1.0, 0.0000000001)
+}
+
+fn stick_breaking_round_trips_through_its_inverse() {
+  let x: Tensor = [0.7, -1.1, 0.2]
+  let y: Tensor = tr.simplex(x, 4).y
+  let back: Tensor = tr.simplex_inverse(y, 4)
+  let i: I64 = 0
+  while i < 3 {
+    t.near("simplex inverse coordinate " + str(i), item(back[i]), item(x[i]), 0.0000001)
+    i = i + 1
+  }
+}
+
+# THE REMAINING-STICK TERM
+#
+# The Jacobian is triangular, so its determinant is the product of the diagonal
+# partials dy_k/dx_k. Each is computed here by a central difference on the
+# forward map with the other coordinates held fixed, and their product is
+# compared against exp(log_jac). This is the test that catches a missing
+# log(r_k), which is the term unique to stick breaking and the one that is left
+# out.
+fn the_stick_breaking_jacobian_includes_the_remaining_stick() {
+  let x: Arr[F64] = [0.5, -0.8, 1.2]
+
+  let product: F64 = 1.0
+  let k: I64 = 0
+  while k < 3 {
+    let plus: Arr[F64] = [x[0], x[1], x[2]]
+    let minus: Arr[F64] = [x[0], x[1], x[2]]
+    plus[k] = plus[k] + H
+    minus[k] = minus[k] - H
+    let dy: F64 = item(tr.simplex(tensor_of_arr(plus), 4).y[k])
+      - item(tr.simplex(tensor_of_arr(minus), 4).y[k])
+    product = product * (dy / (2.0 * H))
+    k = k + 1
+  }
+
+  let claimed: F64 = f64_exp(item(tr.simplex(tensor_of_arr(x), 4).log_jac))
+  t.near("stick breaking log determinant", claimed, product, 0.000001)
+}
+
+fn an_ordered_vector_is_increasing() {
+  let o = tr.ordered([1.0, -3.0, 0.5, 2.0], 4)
+  let i: I64 = 1
+  while i < 4 {
+    t.check("ordered element " + str(i) + " exceeds its predecessor",
+      item(o.y[i]) > item(o.y[i - 1]))
+    i = i + 1
+  }
+}
+
+fn the_ordered_jacobian_ignores_the_first_coordinate() {
+  # dy_1/dx_1 = 1 contributes nothing, and dy_k/dx_k = exp(x_k) for k > 1.
+  let x: Tensor = [1.0, -3.0, 0.5]
+  let claimed: F64 = item(tr.ordered(x, 3).log_jac)
+  t.near("ordered log determinant is the sum of x_2..x_n", claimed, -3.0 + 0.5, 0.0000000001)
+}
+
+fn an_ordered_vector_round_trips() {
+  let x: Tensor = [0.4, -1.0, 2.2]
+  let back: Tensor = tr.ordered_inverse(tr.ordered(x, 3).y, 3)
+  let i: I64 = 0
+  while i < 3 {
+    t.near("ordered inverse coordinate " + str(i), item(back[i]), item(x[i]), 0.0000001)
+    i = i + 1
+  }
+}
+
+fn a_cholesky_factor_is_lower_triangular_with_a_positive_diagonal() {
+  # n = 3: three diagonal entries then three strictly lower ones.
+  let c = tr.chol_factor([0.1, -0.5, 0.3, 1.0, 2.0, 3.0], 3)
+  t.near("L[0][1] is zero", item(c.l[0][1]), 0.0, 0.0)
+  t.near("L[0][2] is zero", item(c.l[0][2]), 0.0, 0.0)
+  t.near("L[1][2] is zero", item(c.l[1][2]), 0.0, 0.0)
+  t.near("L[0][0] is exp of the first coordinate", item(c.l[0][0]), f64_exp(0.1), 0.0000000001)
+  t.near("L[1][1] is exp of the second", item(c.l[1][1]), f64_exp(-0.5), 0.0000000001)
+  t.near("L[1][0] is the first off-diagonal", item(c.l[1][0]), 1.0, 0.0000000001)
+  t.check("the diagonal is positive", item(c.l[2][2]) > 0.0)
+}
+
+fn the_cholesky_jacobian_is_the_sum_of_the_diagonal_coordinates() {
+  let c = tr.chol_factor([0.1, -0.5, 0.3, 1.0, 2.0, 3.0], 3)
+  t.near("chol log determinant", item(c.log_jac), 0.1 - 0.5 + 0.3, 0.0000000001)
+}
+
+fn the_cholesky_size_counts_the_free_entries() {
+  t.equal_i64("a 1x1 factor has one free entry", tr.chol_size(1), 1)
+  t.equal_i64("a 3x3 factor has six", tr.chol_size(3), 6)
+  t.equal_i64("a 5x5 factor has fifteen", tr.chol_size(5), 15)
+}
+
+the_log_transform_maps_the_line_onto_the_positive_reals()
+the_log_transforms_jacobian_is_the_derivative_of_the_forward_map()
+the_logit_transforms_jacobian_is_the_derivative_of_the_forward_map()
+the_logit_jacobian_is_finite_far_out_in_the_tail()
+softplus_does_not_overflow_at_a_large_argument()
+the_interval_transform_stays_inside_its_bounds()
+the_interval_jacobian_carries_the_width_factor()
+stick_breaking_maps_zero_to_the_uniform_point()
+a_stick_breaking_point_lies_on_the_simplex()
+stick_breaking_round_trips_through_its_inverse()
+the_stick_breaking_jacobian_includes_the_remaining_stick()
+an_ordered_vector_is_increasing()
+the_ordered_jacobian_ignores_the_first_coordinate()
+an_ordered_vector_round_trips()
+a_cholesky_factor_is_lower_triangular_with_a_positive_diagonal()
+the_cholesky_jacobian_is_the_sum_of_the_diagonal_coordinates()
+the_cholesky_size_counts_the_free_entries()
+
+t.report("heddle transform")

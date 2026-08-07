@@ -1,0 +1,289 @@
+mode systems
+
+import "harness.tw" as t
+import "../src/diag.tw" as diag
+import "../src/chain.tw" as chain
+
+import "std/random" as random
+
+# The diagnostics are tested against constructed series whose answer is known,
+# rather than against sampler output whose answer is not. A diagnostic that is
+# only ever exercised on real chains is a diagnostic nobody has checked.
+
+fn independent_chains_have_an_r_hat_of_one() {
+  let r: random.Rng = random.new_rng(1)
+  let chains: Arr[Arr[F64]] = []
+  let c: I64 = 0
+  while c < 4 {
+    let s: Arr[F64] = []
+    let i: I64 = 0
+    while i < 1000 {
+      push(s, random.normal(r))
+      i = i + 1
+    }
+    push(chains, s)
+    c = c + 1
+  }
+  t.check("independent chains converge", diag.rhat(chains) < 1.01)
+}
+
+fn chains_at_different_locations_have_a_large_r_hat() {
+  let r: random.Rng = random.new_rng(2)
+  let chains: Arr[Arr[F64]] = []
+  let c: I64 = 0
+  while c < 4 {
+    let s: Arr[F64] = []
+    let i: I64 = 0
+    while i < 1000 {
+      push(s, random.normal(r) + f64_of_i64(c) * 3.0)
+      i = i + 1
+    }
+    push(chains, s)
+    c = c + 1
+  }
+  t.check("chains that disagree are caught", diag.rhat(chains) > 1.5)
+}
+
+# THE REASON FOR THE SPLIT. Four chains drifting slowly in the same direction
+# agree with each other at every moment, so an unsplit R-hat sees no
+# between-chain variance and reports 1.00 for a run that has not converged at
+# all. Splitting each chain in half turns the drift into a disagreement between
+# the halves.
+fn a_slowly_drifting_chain_is_caught_by_the_split() {
+  let r: random.Rng = random.new_rng(3)
+  let chains: Arr[Arr[F64]] = []
+  let c: I64 = 0
+  while c < 4 {
+    let s: Arr[F64] = []
+    let i: I64 = 0
+    while i < 1000 {
+      push(s, random.normal(r) + f64_of_i64(i) * 0.004)
+      i = i + 1
+    }
+    push(chains, s)
+    c = c + 1
+  }
+  t.check("a common drift is a within-chain disagreement", diag.rhat(chains) > 1.05)
+}
+
+# THE REASON FOR RANK NORMALISATION. A Cauchy has no variance, so the classic
+# variance-ratio R-hat is a ratio of two quantities that do not converge, and it
+# reports whatever the largest draw happened to be. The rank-normalised version
+# is exactly normal by construction and behaves.
+fn r_hat_survives_a_distribution_with_no_variance() {
+  let r: random.Rng = random.new_rng(4)
+  let chains: Arr[Arr[F64]] = []
+  let c: I64 = 0
+  while c < 4 {
+    let s: Arr[F64] = []
+    let i: I64 = 0
+    while i < 1000 {
+      # A ratio of two standard normals is standard Cauchy.
+      push(s, random.normal(r) / random.normal(r))
+      i = i + 1
+    }
+    push(chains, s)
+    c = c + 1
+  }
+  let v: F64 = diag.rhat(chains)
+  t.check("R-hat on a Cauchy is finite", v < 1.5 and v > 0.9)
+}
+
+fn r_hat_is_invariant_under_a_monotone_transformation() {
+  let r: random.Rng = random.new_rng(5)
+  let a: Arr[Arr[F64]] = []
+  let b: Arr[Arr[F64]] = []
+  let c: I64 = 0
+  while c < 4 {
+    let s: Arr[F64] = []
+    let e: Arr[F64] = []
+    let i: I64 = 0
+    while i < 600 {
+      let x: F64 = random.normal(r) + f64_of_i64(c) * 0.5
+      push(s, x)
+      push(e, f64_exp(x))
+      i = i + 1
+    }
+    push(a, s)
+    push(b, e)
+    c = c + 1
+  }
+  # Rank normalisation makes this exact, because exp is monotone and ranks are
+  # unchanged by it. The classic R-hat would give two different answers.
+  t.near("R-hat is transformation invariant", diag.rhat(a), diag.rhat(b), 0.0000000001)
+}
+
+fn independent_draws_have_an_effective_sample_size_near_their_count() {
+  let r: random.Rng = random.new_rng(6)
+  let chains: Arr[Arr[F64]] = []
+  let c: I64 = 0
+  while c < 4 {
+    let s: Arr[F64] = []
+    let i: I64 = 0
+    while i < 1000 {
+      push(s, random.normal(r))
+      i = i + 1
+    }
+    push(chains, s)
+    c = c + 1
+  }
+  let e: F64 = diag.ess(chains)
+  t.check("independent draws are worth about their count", e > 3200.0 and e < 4800.0)
+}
+
+# An AR(1) with coefficient phi has an autocorrelation time of
+# (1 + phi)/(1 - phi). At phi = 0.8 that is 9, so 4000 draws are worth about
+# 444. This is the test that catches a truncation rule that stops too early,
+# which would report several times too many.
+fn a_correlated_series_has_a_much_smaller_effective_sample_size() {
+  let r: random.Rng = random.new_rng(7)
+  let phi: F64 = 0.8
+  let chains: Arr[Arr[F64]] = []
+  let c: I64 = 0
+  while c < 4 {
+    let s: Arr[F64] = []
+    let x: F64 = random.normal(r)
+    let i: I64 = 0
+    while i < 1000 {
+      x = phi * x + f64_sqrt(1.0 - phi * phi) * random.normal(r)
+      push(s, x)
+      i = i + 1
+    }
+    push(chains, s)
+    c = c + 1
+  }
+  let e: F64 = diag.ess(chains)
+  # The theoretical value is 4000/9 = 444. The bracket allows for the estimator
+  # being conservative, which the monotone clipping makes it.
+  t.check("an AR(1) at phi=0.8 is worth roughly a ninth", e > 250.0 and e < 750.0)
+}
+
+fn a_stuck_chain_has_almost_no_effective_sample_size() {
+  let chains: Arr[Arr[F64]] = []
+  let c: I64 = 0
+  while c < 4 {
+    let s: Arr[F64] = []
+    let i: I64 = 0
+    while i < 500 {
+      # Two hundred and fifty repeats of two values. Correlated to the point of
+      # being useless.
+      if i < 250 {
+        push(s, 0.0 + f64_of_i64(c))
+      } else {
+        push(s, 1.0 + f64_of_i64(c))
+      }
+      i = i + 1
+    }
+    push(chains, s)
+    c = c + 1
+  }
+  t.check("a stuck chain is worth very little", diag.ess(chains) < 100.0)
+}
+
+fn the_monte_carlo_standard_error_shrinks_with_the_effective_sample_size() {
+  let r: random.Rng = random.new_rng(8)
+  let chains: Arr[Arr[F64]] = []
+  let c: I64 = 0
+  while c < 4 {
+    let s: Arr[F64] = []
+    let i: I64 = 0
+    while i < 1000 {
+      push(s, random.normal(r))
+      i = i + 1
+    }
+    push(chains, s)
+    c = c + 1
+  }
+  # sd / sqrt(4000) is about 0.0158.
+  t.near("mcse of a standard normal over 4000 independent draws",
+    diag.mcse_mean(chains), 0.0158, 0.005)
+}
+
+fn the_inverse_normal_cdf_inverts_the_known_points() {
+  t.near("the median", diag.inv_normal_cdf(0.5), 0.0, 0.000000000001)
+  t.near("one sigma", diag.inv_normal_cdf(0.8413447460685429), 1.0, 0.0000001)
+  t.near("two sigma below", diag.inv_normal_cdf(0.022750131948179195), -2.0, 0.0000001)
+  t.near("the far tail", diag.inv_normal_cdf(0.0000001), -5.199337582187471, 0.00001)
+}
+
+fn quantiles_interpolate_between_order_statistics() {
+  let a: Arr[F64] = [1.0, 2.0, 3.0, 4.0, 5.0]
+  t.near("the minimum", diag.quantile_sorted(a, 0.0), 1.0, 0.0)
+  t.near("the median", diag.quantile_sorted(a, 0.5), 3.0, 0.0)
+  t.near("the maximum", diag.quantile_sorted(a, 1.0), 5.0, 0.0)
+  t.near("a quarter of the way", diag.quantile_sorted(a, 0.25), 2.0, 0.0)
+  t.near("an interpolated point", diag.quantile_sorted(a, 0.375), 2.5, 0.000000000001)
+}
+
+fn a_divergence_produces_a_warning() {
+  let c = chain.new_chain(1, 2)
+  push(c.draws, [0.0, 0.0])
+  push(c.divergent, true)
+  c.n_divergent = 1
+  let cs: Arr[chain.Chain] = [c]
+  let names: Arr[Str] = []
+  let w: Arr[Str] = diag.warnings(cs, diag.summarise(cs, names), 10)
+  t.check("a divergence is reported", len(w) > 0)
+}
+
+fn a_clean_short_run_still_warns_about_its_effective_sample_size() {
+  # Because it should. A run with fifty draws has no business being trusted and
+  # the summary should say so rather than printing a tidy table.
+  let r: random.Rng = random.new_rng(9)
+  let cs: Arr[chain.Chain] = []
+  let c: I64 = 0
+  while c < 2 {
+    let ch = chain.new_chain(c, 1)
+    let i: I64 = 0
+    while i < 50 {
+      push(ch.draws, [random.normal(r)])
+      push(ch.accept_stat, 0.9)
+      i = i + 1
+    }
+    push(cs, ch)
+    c = c + 1
+  }
+  let names: Arr[Str] = ["theta"]
+  let w: Arr[Str] = diag.warnings(cs, diag.summarise(cs, names), 10)
+  t.check("fifty draws are not enough and the summary says so", len(w) > 0)
+}
+
+fn the_summary_labels_columns_with_the_names_it_is_given() {
+  let r: random.Rng = random.new_rng(10)
+  let cs: Arr[chain.Chain] = []
+  let c: I64 = 0
+  while c < 2 {
+    let ch = chain.new_chain(c, 2)
+    let i: I64 = 0
+    while i < 200 {
+      push(ch.draws, [random.normal(r), random.normal(r) * 2.0 + 1.0])
+      i = i + 1
+    }
+    push(cs, ch)
+    c = c + 1
+  }
+  let names: Arr[Str] = ["alpha", "beta"]
+  let s = diag.summarise(cs, names)
+  t.equal_i64("one row per coordinate", len(s), 2)
+  t.equal_str("the first row is named", s[0].name, "alpha")
+  t.equal_str("the second row is named", s[1].name, "beta")
+  t.near("and the second coordinate's mean is recovered", s[1].mean, 1.0, 0.25)
+  t.near("and its standard deviation", s[1].sd, 2.0, 0.25)
+}
+
+independent_chains_have_an_r_hat_of_one()
+chains_at_different_locations_have_a_large_r_hat()
+a_slowly_drifting_chain_is_caught_by_the_split()
+r_hat_survives_a_distribution_with_no_variance()
+r_hat_is_invariant_under_a_monotone_transformation()
+independent_draws_have_an_effective_sample_size_near_their_count()
+a_correlated_series_has_a_much_smaller_effective_sample_size()
+a_stuck_chain_has_almost_no_effective_sample_size()
+the_monte_carlo_standard_error_shrinks_with_the_effective_sample_size()
+the_inverse_normal_cdf_inverts_the_known_points()
+quantiles_interpolate_between_order_statistics()
+a_divergence_produces_a_warning()
+a_clean_short_run_still_warns_about_its_effective_sample_size()
+the_summary_labels_columns_with_the_names_it_is_given()
+
+t.report("heddle diag")

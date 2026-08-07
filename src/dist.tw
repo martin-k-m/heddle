@@ -1,0 +1,574 @@
+mode systems
+
+# dist.tw: distributions, as three separable things.
+#
+# A distribution in heddle is not an object. It is a log density, a sampler,
+# and, where one exists, a reparameterised sampler. They are separate functions
+# because they are needed at separate times by separate code: the log density is
+# what a model calls and what `grad` differentiates, the sampler is what a
+# prior predictive check or a Gibbs step calls, and the reparameterised sampler
+# is what variational inference calls and what nothing else does.
+#
+# Bundling them into one struct with three fields would need function values in
+# struct fields, which twill does not have yet (docs/needs.md entry 3), and it
+# would buy nothing: no code in this repository dispatches over a distribution
+# at runtime. The model writer names the distribution at the call site.
+#
+# WHAT log_prob RETURNS
+#
+# A rank-0 tensor holding the log density summed over the elements of the
+# value. Summed rather than elementwise, because the caller is building one
+# scalar log posterior and would sum it immediately anyway, and because an
+# elementwise return would make the common case
+# `normal_log_prob(y, mu, sigma)` for a 10,000-element y allocate a 10,000
+# element tape node to be summed one step later.
+#
+# Every one of them is written from differentiable primitives only, so `grad`
+# of a model that calls them works with no backward pass written anywhere. That
+# is the whole argument for this library existing in twill rather than
+# somewhere else, and it is why no function here has a hand-written derivative.
+#
+# NORMALISING CONSTANTS ARE KEPT
+#
+# Every density below is complete, including the terms that do not depend on
+# the value. Dropping them is standard practice and it is wrong here for two
+# reasons. Model comparison and the ADVI evidence lower bound both read the
+# absolute value of the log density, and a hierarchical model's "constant" is
+# usually a function of a parameter one level up, so the constant that was safe
+# to drop today acquires a gradient tomorrow and nothing tells you.
+
+import "std/random" as random
+
+let LOG_TWO_PI: F64 = 1.8378770664093453
+let LOG_PI: F64 = 1.1447298858494002
+let SQRT_TWO: F64 = 1.4142135623730951
+let LOG_TWO: F64 = 0.6931471805599453
+
+# ---- log gamma, differentiably ---------------------------------------------
+#
+# `std/stats.tw` has an `lgamma` over `F64` and heddle cannot use it. The shape
+# parameter of a gamma prior is a parameter: a hierarchical model puts a
+# hyperprior on it, the sampler moves it, and the log density has to be
+# differentiable with respect to it. An `F64` function is a constant to `grad`
+# and would report a zero gradient in that coordinate, which is not an error,
+# it is a posterior that never updates the shape and a trace plot that looks
+# like a very well-mixed flat line.
+#
+# So this is the Lanczos approximation again, built from tensor primitives so
+# the tape records it. g = 7, nine coefficients, accurate to about 15
+# significant digits for the positive reals, which is where every use of it in
+# this file lives. It is not defined for x <= 0 and does not pretend to be:
+# reflection would need a sin term that is exactly zero at every negative
+# integer, and a distribution parameter is never there.
+
+fn lgamma(x: Tensor) -> Tensor {
+  let z: Tensor = x - 1.0
+  let a: Tensor = 0.99999999999980993
+    + 676.5203681218851 / (z + 1.0)
+    - 1259.1392167224028 / (z + 2.0)
+    + 771.32342877765313 / (z + 3.0)
+    - 176.61502916214059 / (z + 4.0)
+    + 12.507343278686905 / (z + 5.0)
+    - 0.13857109526572012 / (z + 6.0)
+    + 0.0000099843695780195716 / (z + 7.0)
+    + 0.00000015056327351493116 / (z + 8.0)
+  let t: Tensor = z + 7.5
+  0.5 * LOG_TWO_PI + (z + 0.5) * log(t) - t + log(a)
+}
+
+# log B(a, b) = lgamma(a) + lgamma(b) - lgamma(a + b).
+fn lbeta(a: Tensor, b: Tensor) -> Tensor = lgamma(a) + lgamma(b) - lgamma(a + b)
+
+# ---- normal -----------------------------------------------------------------
+#
+#   log p(y) = -log(sigma) - 0.5*log(2*pi) - 0.5*((y - mu)/sigma)^2
+#
+# `sigma` is the standard deviation, never the variance and never the
+# precision. Every distribution in heddle and in `std/random.tw` uses the
+# standard deviation, because a codebase that mixes the two is wrong by a
+# square root in a way that still produces plausible numbers.
+#
+# Broadcasting does the work: y may be a vector and mu and sigma scalars, or
+# all three vectors of the same length, and the sum covers whichever it is.
+
+fn normal_log_prob(y: Tensor, mu: Tensor, sigma: Tensor) -> Tensor {
+  let z: Tensor = (y - mu) / sigma
+  sum(0.0 - log(sigma) - 0.5 * LOG_TWO_PI - 0.5 * z * z)
+}
+
+fn normal_sample(r: random.Rng, mu: F64, sigma: F64) -> F64 =
+  random.normal_with(r, mu, sigma)
+
+# The reparameterised form. Draw eps from the standard normal outside the
+# gradient, then mu + sigma*eps is differentiable in mu and sigma with eps held
+# fixed. This is the trick the whole of `src/advi.tw` runs on: it moves the
+# randomness out of the path the gradient takes, so a Monte Carlo estimate of
+# the gradient of an expectation becomes the gradient of a Monte Carlo
+# estimate, and the variance of that estimator is smaller by orders of
+# magnitude than the score-function alternative.
+fn normal_reparam(eps: Tensor, mu: Tensor, sigma: Tensor) -> Tensor =
+  mu + sigma * eps
+
+# ---- half normal ------------------------------------------------------------
+#
+# The normal folded at zero, for a scale parameter. Support (0, inf), density
+# twice the normal's:
+#
+#   log p(y) = log 2 - log(sigma) - 0.5*log(2*pi) - 0.5*(y/sigma)^2
+#
+# The `log 2` is the constant this file's header warns about. It is constant in
+# y and in sigma, so dropping it changes no gradient and no posterior, and it
+# changes the evidence lower bound `src/advi.tw` prints, which is the number a
+# user compares between two models.
+#
+# Zero mean is not a parameter. A half normal with a location is a truncated
+# normal, whose normalising constant needs the normal cdf and is a different
+# function; pretending otherwise by adding a `mu` argument here would give a
+# density that does not integrate to one.
+
+fn half_normal_log_prob(y: Tensor, sigma: Tensor) -> Tensor {
+  let z: Tensor = y / sigma
+  sum(LOG_TWO - log(sigma) - 0.5 * LOG_TWO_PI - 0.5 * z * z)
+}
+
+fn half_normal_sample(r: random.Rng, sigma: F64) -> F64 {
+  let z: F64 = random.normal(r) * sigma
+  if z < 0.0 {
+    return 0.0 - z
+  }
+  z
+}
+
+# Reparameterised: sigma * |eps|. Differentiable in sigma everywhere except at
+# eps = 0, which has probability zero, and `abs` is a differentiable primitive
+# in twill with the subgradient 0 there.
+fn half_normal_reparam(eps: Tensor, sigma: Tensor) -> Tensor = sigma * abs(eps)
+
+# ---- lognormal --------------------------------------------------------------
+#
+#   y = exp(x), x ~ Normal(mu, sigma), y in (0, inf)
+#
+#   log p(y) = -log(y) - log(sigma) - 0.5*log(2*pi) - 0.5*((log y - mu)/sigma)^2
+#
+# The leading -log(y) is the Jacobian of the exponential, and it is the same
+# term `src/transform.tw` insists on. It appears here rather than there because
+# the lognormal is a distribution over the constrained value: a caller writing
+# `lognormal_log_prob(y, ...)` for a y they already hold is not transforming
+# anything and must not add a Jacobian term of their own. A caller sampling an
+# unconstrained x and exponentiating it should use `normal_log_prob` on x and
+# `positive_log_jac`, and will get an identical number. Both routes are correct
+# and using both at once double-counts.
+
+fn lognormal_log_prob(y: Tensor, mu: Tensor, sigma: Tensor) -> Tensor {
+  let ly: Tensor = log(y)
+  let z: Tensor = (ly - mu) / sigma
+  sum(0.0 - ly - log(sigma) - 0.5 * LOG_TWO_PI - 0.5 * z * z)
+}
+
+fn lognormal_sample(r: random.Rng, mu: F64, sigma: F64) -> F64 =
+  f64_exp(random.normal_with(r, mu, sigma))
+
+fn lognormal_reparam(eps: Tensor, mu: Tensor, sigma: Tensor) -> Tensor =
+  exp(mu + sigma * eps)
+
+# ---- student t --------------------------------------------------------------
+#
+#   log p(y) = lgamma((nu+1)/2) - lgamma(nu/2) - 0.5*log(nu*pi) - log(sigma)
+#              - ((nu+1)/2) * log(1 + (1/nu)*((y-mu)/sigma)^2)
+#
+# The robust regression likelihood, and the default weakly informative prior
+# worth having. `nu` is a real parameter here, not an integer, and the lgamma
+# above is why it can be: a nu that only appeared in an F64 lgamma could be
+# sampled but never learned.
+#
+# As nu goes to infinity this converges to the normal. It does so slowly and
+# the sampler notices: a posterior for nu that is diffuse above about 30 means
+# the data cannot distinguish the t from the normal, which is information and
+# not a failure.
+
+fn student_t_log_prob(y: Tensor, nu: Tensor, mu: Tensor, sigma: Tensor) -> Tensor {
+  let z: Tensor = (y - mu) / sigma
+  let half: Tensor = 0.5 * nu
+  let norm: Tensor = lgamma(half + 0.5) - lgamma(half) - 0.5 * log(nu) - 0.5 * LOG_PI
+  sum(norm - log(sigma) - (half + 0.5) * log(1.0 + z * z / nu))
+}
+
+# t = mu + sigma * z / sqrt(v / nu), z standard normal, v ~ chi-squared(nu).
+# A chi-squared with nu degrees of freedom is a gamma with shape nu/2 and
+# scale 2, which is what is drawn.
+fn student_t_sample(r: random.Rng, nu: F64, mu: F64, sigma: F64) -> F64 {
+  let z: F64 = random.normal(r)
+  let v: F64 = gamma_sample(r, 0.5 * nu, 2.0)
+  mu + sigma * z / f64_sqrt(v / nu)
+}
+
+# Reparameterised in mu and sigma only. `eps` must be a standard t draw at the
+# same nu, and nu is therefore held fixed. There is no reparameterisation that
+# is differentiable in nu, because nu changes the shape of the standard
+# distribution rather than shifting or scaling it, and the honest statement of
+# that is this comment rather than a function that quietly returns a wrong
+# gradient. `src/advi.tw` uses normal variational families for exactly this
+# reason.
+fn student_t_reparam(eps: Tensor, mu: Tensor, sigma: Tensor) -> Tensor =
+  mu + sigma * eps
+
+# ---- exponential ------------------------------------------------------------
+#
+#   log p(y) = log(rate) - rate * y,   y in (0, inf)
+#
+# Parameterised by rate, not by scale. The two are reciprocals and the
+# literature uses both, so heddle picks one and says which: `rate` is the
+# expected number of events per unit, and the mean of the distribution is
+# 1/rate.
+
+fn exponential_log_prob(y: Tensor, rate: Tensor) -> Tensor =
+  sum(log(rate) - rate * y)
+
+fn exponential_sample(r: random.Rng, rate: F64) -> F64 {
+  # Inverse cdf. `uniform_open` excludes zero, so the log is never -inf;
+  # `uniform` includes it and would produce an infinite draw about once in
+  # 2^53 calls, which is exactly often enough to happen to somebody.
+  0.0 - f64_log(random.uniform_open(r)) / rate
+}
+
+# Reparameterised through the inverse cdf: for u uniform on (0,1),
+# -log(u)/rate is exponential and is differentiable in rate. This is a genuine
+# reparameterisation and not an approximation, because the inverse cdf is
+# available in closed form. Most distributions are not so lucky.
+fn exponential_reparam(u: Tensor, rate: Tensor) -> Tensor =
+  (0.0 - log(u)) / rate
+
+# ---- gamma ------------------------------------------------------------------
+#
+# Shape and scale, not shape and rate. Chosen because the chi-squared and the
+# Erlang are both natural in scale form and because `student_t_sample` above
+# reads correctly with it. The rate form is scale = 1/rate.
+#
+#   log p(y) = (k-1)*log(y) - y/theta - k*log(theta) - lgamma(k)
+
+fn gamma_log_prob(y: Tensor, shape: Tensor, scale: Tensor) -> Tensor =
+  sum((shape - 1.0) * log(y) - y / scale - shape * log(scale) - lgamma(shape))
+
+# Marsaglia and Tsang. For shape >= 1 it is a squeeze on a cubed normal with an
+# acceptance rate above 0.98 for every shape, and for shape < 1 it boosts to
+# shape+1 and applies the u^(1/shape) correction, which is exact rather than
+# approximate.
+#
+# The rejection loop means the number of draws consumed from the generator is
+# data-dependent. `std/random.tw` guarantees a reproducible stream for a fixed
+# sequence of calls and this is still a fixed sequence for a fixed seed, so
+# reproducibility holds; what does not hold is the position of the stream being
+# a fixed function of the number of gamma draws. Nothing in heddle depends on
+# that, and `src/rng.tw` in loom is the cautionary example of code that did.
+fn gamma_sample(r: random.Rng, shape: F64, scale: F64) -> F64 {
+  if shape < 1.0 {
+    let g: F64 = gamma_sample(r, shape + 1.0, scale)
+    let u: F64 = random.uniform_open(r)
+    return g * f64_pow(u, 1.0 / shape)
+  }
+
+  let d: F64 = shape - 1.0 / 3.0
+  let c: F64 = 1.0 / f64_sqrt(9.0 * d)
+
+  while true {
+    let x: F64 = random.normal(r)
+    let v: F64 = 1.0 + c * x
+    if v <= 0.0 {
+      # The cube would be negative and the transform undefined. Redraw rather
+      # than clamp: clamping puts an atom at zero in what is a continuous
+      # distribution.
+      continue
+    }
+    let v3: F64 = v * v * v
+    let u: F64 = random.uniform_open(r)
+    let xsq: F64 = x * x
+
+    # The cheap squeeze first. It accepts the great majority of draws without
+    # touching a logarithm, which is the reason this algorithm is fast.
+    if u < 1.0 - 0.0331 * xsq * xsq {
+      return d * v3 * scale
+    }
+    if f64_log(u) < 0.5 * xsq + d * (1.0 - v3 + f64_log(v3)) {
+      return d * v3 * scale
+    }
+  }
+
+  # Unreachable. Present because the loop's exit is inside it.
+  0.0
+}
+
+# There is no exact reparameterisation of a gamma. The shape parameter changes
+# the distribution's form and no fixed-noise transform reproduces it, which is
+# why variational inference over a gamma either uses an implicit-gradient
+# scheme or, as heddle does, transforms the parameter to the unconstrained line
+# and puts a normal on it. Stated here rather than left as a missing function,
+# because a missing function reads as an oversight.
+
+# ---- beta -------------------------------------------------------------------
+#
+#   log p(y) = (a-1)*log(y) + (b-1)*log(1-y) - log B(a, b),   y in (0, 1)
+#
+# The conjugate prior for a probability, and the reason `unit_forward` exists.
+# A beta placed on a sampled unconstrained x through the logit transform needs
+# `unit_log_jac`; a beta placed on a y that is already in (0,1) does not.
+
+fn beta_log_prob(y: Tensor, a: Tensor, b: Tensor) -> Tensor =
+  sum((a - 1.0) * log(y) + (b - 1.0) * log(1.0 - y) - lbeta(a, b))
+
+# Two gammas, normalised. Correct for every a and b including the U-shaped
+# cases below one, where an inverse-cdf method would need a root find.
+fn beta_sample(r: random.Rng, a: F64, b: F64) -> F64 {
+  let x: F64 = gamma_sample(r, a, 1.0)
+  let y: F64 = gamma_sample(r, b, 1.0)
+  x / (x + y)
+}
+
+# ---- dirichlet --------------------------------------------------------------
+#
+#   log p(y) = sum (alpha_k - 1)*log(y_k) + lgamma(sum alpha) - sum lgamma(alpha_k)
+#
+# Over the simplex, so `y` must sum to one, and the caller is expected to have
+# produced it with `transform.simplex` and added that transform's Jacobian.
+# heddle does not check the sum. A check would need a tolerance, the tolerance
+# would be wrong for some K, and the failure mode of an unchecked violation is
+# a visibly absurd posterior rather than a subtle bias.
+#
+# The density is over K-1 dimensions even though y has K components. That is
+# the same fact `transform.simplex` is built on and it is why the two are used
+# together or not at all.
+
+fn dirichlet_log_prob(y: Tensor, alpha: Tensor) -> Tensor =
+  sum((alpha - 1.0) * log(y)) + lgamma(sum(alpha)) - sum(lgamma(alpha))
+
+fn dirichlet_sample(r: random.Rng, alpha: Arr[F64]) -> Arr[F64] {
+  let gs: Arr[F64] = []
+  let total: F64 = 0.0
+  let i: I64 = 0
+  while i < len(alpha) {
+    let g: F64 = gamma_sample(r, alpha[i], 1.0)
+    push(gs, g)
+    total = total + g
+    i = i + 1
+  }
+
+  let out: Arr[F64] = []
+  i = 0
+  while i < len(gs) {
+    push(out, gs[i] / total)
+    i = i + 1
+  }
+  out
+}
+
+# ---- categorical ------------------------------------------------------------
+#
+#   log p(k) = log(p_k)
+#
+# `logits` rather than probabilities, and the normalisation is done here with
+# `logsumexp`. Taking probabilities would mean the caller either normalises
+# (and their gradient flows through their own normalisation, which is fine but
+# is their problem to get right) or does not (and the density is not a
+# density). Taking logits means the caller hands over an unconstrained vector,
+# which is what a linear predictor produces anyway.
+#
+# `k` is an index and is not differentiable, so it is an I64 and not a tensor.
+# An observed category is data.
+
+fn categorical_log_prob(logits: Tensor, k: I64) -> Tensor =
+  logits[k] - logsumexp(logits, 0)
+
+# The same for a whole vector of observations, which is what a likelihood
+# actually looks like. One `logsumexp` for the shared logits, and a sum of the
+# selected entries via `gather`, whose gradient scatters back and accumulates
+# on repeated indices. Written this way rather than as a loop because a loop of
+# 10,000 tensor indexings builds 10,000 tape nodes.
+fn categorical_log_prob_many(logits: Tensor, ks: Tensor, n: I64) -> Tensor =
+  sum(gather(logits, ks)) - f64_of_i64(n) * logsumexp(logits, 0)
+
+fn categorical_sample(r: random.Rng, probs: Arr[F64]) -> I64 {
+  let u: F64 = random.uniform(r)
+  let acc: F64 = 0.0
+  let i: I64 = 0
+  while i < len(probs) {
+    acc = acc + probs[i]
+    if u < acc {
+      return i
+    }
+    i = i + 1
+  }
+  # Reached only when the probabilities sum to slightly under one through
+  # rounding. Returning the last category is right: the missing mass is on the
+  # order of 1e-16 and it belongs to whichever category rounding took it from,
+  # and returning -1 here would push a shape error into the caller's likelihood
+  # for a floating-point artefact.
+  len(probs) - 1
+}
+
+# ---- multinomial ------------------------------------------------------------
+#
+#   log p(counts) = log(n!) - sum log(c_k!) + sum c_k * log(p_k)
+#
+# The counts are data, so the factorial terms are constants in the parameters,
+# and they are kept for the reason the header gives. They are computed with
+# `lgamma(c + 1)` rather than a factorial loop, which handles a count of
+# 1,000,000 without overflowing and needs no integer type.
+#
+# `counts` is a tensor rather than an `Arr[I64]` so the whole expression stays
+# on the tape and `logits` gets its gradient without a conversion.
+
+fn multinomial_log_prob(counts: Tensor, logits: Tensor) -> Tensor {
+  let n: Tensor = sum(counts)
+  let log_p: Tensor = logits - logsumexp(logits, 0)
+  lgamma(n + 1.0) - sum(lgamma(counts + 1.0)) + sum(counts * log_p)
+}
+
+# Sequential conditional binomials. Drawing n independent categoricals is the
+# obvious method and is O(n); this is O(K) and K is the number of categories,
+# which is the difference between a millisecond and a minute when n is large,
+# which for count data it is.
+#
+# The conditional trick: given the first k-1 counts, the k-th is binomial with
+# the remaining trials and the probability p_k renormalised by the mass not yet
+# spent.
+fn multinomial_sample(r: random.Rng, n: I64, probs: Arr[F64]) -> Arr[I64] {
+  let k: I64 = len(probs)
+  let out: Arr[I64] = []
+  let left: I64 = n
+  let remaining_p: F64 = 1.0
+
+  let i: I64 = 0
+  while i < k - 1 {
+    if left <= 0 {
+      push(out, 0)
+      i = i + 1
+      continue
+    }
+    let p: F64 = probs[i] / remaining_p
+    if p >= 1.0 {
+      push(out, left)
+      left = 0
+      remaining_p = remaining_p - probs[i]
+      i = i + 1
+      continue
+    }
+    let c: I64 = binomial_sample(r, left, p)
+    push(out, c)
+    left = left - c
+    remaining_p = remaining_p - probs[i]
+    i = i + 1
+  }
+
+  # The last category takes whatever trials are left, by construction rather
+  # than by another draw. Drawing it would allow the counts to sum to something
+  # other than n.
+  push(out, left)
+  out
+}
+
+# Inversion by repeated Bernoulli. `std/stats.tw` has a binomial sampler over
+# its own `Binomial` struct; this one is here so multinomial does not depend on
+# that module's parameterisation for one call.
+fn binomial_sample(r: random.Rng, n: I64, p: F64) -> I64 {
+  let c: I64 = 0
+  let i: I64 = 0
+  while i < n {
+    if random.uniform(r) < p {
+      c = c + 1
+    }
+    i = i + 1
+  }
+  c
+}
+
+# ---- multivariate normal, Cholesky parameterised ----------------------------
+#
+#   Sigma = L L',  L lower triangular with a positive diagonal
+#
+#   log p(y) = -0.5*d*log(2*pi) - sum(log diag L) - 0.5 * ||L^-1 (y - mu)||^2
+#
+# THE CHOLESKY IS THE PARAMETERISATION, NOT AN IMPLEMENTATION DETAIL
+#
+# Three reasons, and the third is the one that decides it.
+#
+# First, the log determinant is free. log|Sigma| = 2 * sum(log diag L), a
+# single pass over d numbers, against a general determinant that costs a
+# factorisation you would then throw away.
+#
+# Second, the quadratic form is a triangular solve rather than an inverse. An
+# explicit Sigma^-1 is both slower and less accurate, and forming it is the
+# usual route to a covariance that is numerically not symmetric.
+#
+# Third, and decisively: a sampler moving in the space of covariance matrices
+# will propose a matrix that is not positive definite, and every such proposal
+# has log density -inf. The chain then spends its time being rejected at the
+# boundary of the cone. Parameterising by L with a positive diagonal
+# (`transform.chol_factor`) means every point in the unconstrained space maps
+# to a valid covariance, so there is no boundary and no rejection. That is the
+# same argument as the whole of `src/transform.tw`, applied to a matrix.
+#
+# `y` and `mu` are [d] and `l` is [d, d] lower triangular. The solve is written
+# out as forward substitution because twill's `std/linalg.tw` triangular solve
+# is over `Mat` and `Arr[F64]`, which is not differentiable and this must be.
+
+fn mvnormal_log_prob(y: Tensor, mu: Tensor, l: Tensor, d: I64) -> Tensor {
+  let r: Tensor = y - mu
+
+  # Forward substitution: solve L z = r for z, one row at a time. The gradient
+  # flows through every step of this because it is built from indexing,
+  # multiplication and subtraction, all of which twill differentiates.
+  let zs: Arr[Tensor] = []
+  let log_det: Tensor = scalar(0.0)
+
+  let i: I64 = 0
+  while i < d {
+    let acc: Tensor = r[i]
+    let j: I64 = 0
+    while j < i {
+      acc = acc - l[i][j] * zs[j]
+      j = j + 1
+    }
+    let dii: Tensor = l[i][i]
+    push(zs, acc / dii)
+    log_det = log_det + log(dii)
+    i = i + 1
+  }
+
+  let quad: Tensor = scalar(0.0)
+  i = 0
+  while i < d {
+    quad = quad + zs[i] * zs[i]
+    i = i + 1
+  }
+
+  0.0 - 0.5 * f64_of_i64(d) * LOG_TWO_PI - log_det - 0.5 * quad
+}
+
+# mu + L z for a standard normal z. This is both the sampler and the
+# reparameterisation, which is not a coincidence: the multivariate normal is
+# location-scale, and every location-scale family reparameterises exactly.
+fn mvnormal_reparam(eps: Tensor, mu: Tensor, l: Tensor) -> Tensor =
+  mu + l @ eps
+
+fn mvnormal_sample(r: random.Rng, mu: Arr[F64], l: Arr[F64], d: I64) -> Arr[F64] {
+  # `l` is the factor in row-major order, d*d entries.
+  let z: Arr[F64] = []
+  let i: I64 = 0
+  while i < d {
+    push(z, random.normal(r))
+    i = i + 1
+  }
+
+  let out: Arr[F64] = []
+  i = 0
+  while i < d {
+    let acc: F64 = mu[i]
+    let j: I64 = 0
+    while j <= i {
+      acc = acc + l[i * d + j] * z[j]
+      j = j + 1
+    }
+    push(out, acc)
+    i = i + 1
+  }
+  out
+}

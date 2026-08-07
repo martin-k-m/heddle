@@ -1,0 +1,634 @@
+mode systems
+
+# diag.tw: how a user finds out the sampler lied.
+#
+# This file is not an accessory to the samplers. It is the half of the library
+# that makes the other half usable, and it is written first in the design and
+# last in most libraries.
+#
+# The reason is that a Markov chain Monte Carlo run has no failure mode that
+# looks like a failure. There is no exception, no error code, no missing
+# output. A chain that never left its starting neighbourhood returns a
+# beautifully smooth set of draws with a small standard error and a wrong
+# answer. A chain that diverged in the one region where the posterior has mass
+# returns a tidy posterior for the rest of it. The output of a broken run and
+# the output of a good run are the same shape, the same size, and the same
+# type.
+#
+# So the diagnostics are the only thing standing between a user and a
+# confidently wrong number, and heddle treats them as output rather than as
+# an option. `summary` prints them next to every estimate, and the failures are
+# printed as sentences rather than as flags, because a flag gets filtered out
+# of a log and a sentence gets read.
+#
+# THE FOUR THINGS THAT ARE CHECKED
+#
+#   R-hat                  did the chains agree with each other
+#   effective sample size   how many independent draws is this worth
+#   divergences             did the integrator fall off the posterior
+#   tree depth saturation   did the sampler run out of trajectory
+#
+# The first two are about the draws. The last two are about the sampler and
+# have no equivalent for a random walk, which is a reason to prefer NUTS and
+# not only a difference: a random walk that fails does so silently in a way
+# that only R-hat can catch, and R-hat catches it slowly.
+
+import "src/chain.tw" as chain
+import "src/vec.tw" as vec
+
+# ---- basic moments ----------------------------------------------------------
+
+fn mean_of(xs: Arr[F64]) -> F64 {
+  if len(xs) == 0 {
+    return 0.0
+  }
+  let s: F64 = 0.0
+  let i: I64 = 0
+  while i < len(xs) {
+    s = s + xs[i]
+    i = i + 1
+  }
+  s / f64_of_i64(len(xs))
+}
+
+# The sample variance, Bessel corrected. Sample and not population: every use
+# of it here is an estimate of the variance of something wider than the draws
+# in hand, which is the definition of when the correction applies.
+fn var_of(xs: Arr[F64]) -> F64 {
+  let n: I64 = len(xs)
+  if n < 2 {
+    return 0.0
+  }
+  let m: F64 = mean_of(xs)
+  let s: F64 = 0.0
+  let i: I64 = 0
+  while i < n {
+    let d: F64 = xs[i] - m
+    s = s + d * d
+    i = i + 1
+  }
+  s / f64_of_i64(n - 1)
+}
+
+fn sd_of(xs: Arr[F64]) -> F64 = f64_sqrt(var_of(xs))
+
+# ---- quantiles --------------------------------------------------------------
+
+fn sorted_copy(xs: Arr[F64]) -> Arr[F64] {
+  let a: Arr[F64] = vec.copy(xs)
+  # Insertion sort. The arrays here are one coordinate of one chain, so a few
+  # thousand elements, and the summary is computed once per run. A quicksort
+  # would be faster and `std/stats.tw` has one; this is here so `diag.tw` has
+  # no dependency on that module's cutoff constant, which it would otherwise
+  # inherit for a case it was not tuned for.
+  let i: I64 = 1
+  while i < len(a) {
+    let v: F64 = a[i]
+    let j: I64 = i - 1
+    while j >= 0 and a[j] > v {
+      a[j + 1] = a[j]
+      j = j - 1
+    }
+    a[j + 1] = v
+    i = i + 1
+  }
+  a
+}
+
+# Linear interpolation between order statistics, which is the definition most
+# statistical software uses and therefore the one whose numbers a reader can
+# compare against.
+fn quantile_sorted(a: Arr[F64], q: F64) -> F64 {
+  let n: I64 = len(a)
+  if n == 0 {
+    return 0.0
+  }
+  if n == 1 {
+    return a[0]
+  }
+  let pos: F64 = q * f64_of_i64(n - 1)
+  let lo: I64 = i64_of_f64(pos)
+  if lo >= n - 1 {
+    return a[n - 1]
+  }
+  let frac: F64 = pos - f64_of_i64(lo)
+  a[lo] + frac * (a[lo + 1] - a[lo])
+}
+
+# ---- the inverse normal cdf -------------------------------------------------
+#
+# Needed by the rank normalisation below. `std/stats.tw` has `erf` and `erfc`
+# and no inverse, and inverting erf by bisection would be correct and slow and
+# would need a tolerance nobody wants to pick.
+#
+# Acklam's rational approximation, refined by one Halley step against the
+# `erfc` that `std/stats.tw` already has. The approximation alone is accurate
+# to about 1.15e-9 relative, which is enough for a diagnostic; the refinement
+# takes it to full double precision and costs one erfc call, and it is included
+# because the alternative is a diagnostic whose last digits move for reasons
+# that are not the data.
+fn inv_normal_cdf(p: F64) -> F64 {
+  if p <= 0.0 {
+    return -1.0e308
+  }
+  if p >= 1.0 {
+    return 1.0e308
+  }
+
+  let a1: F64 = -39.696830286653757
+  let a2: F64 = 220.94609842452050
+  let a3: F64 = -275.92851044696869
+  let a4: F64 = 138.35775186726900
+  let a5: F64 = -30.664798066147159
+  let a6: F64 = 2.5066282774592392
+
+  let b1: F64 = -54.476098798224058
+  let b2: F64 = 161.58583685804089
+  let b3: F64 = -155.69897985988661
+  let b4: F64 = 66.801311887719720
+  let b5: F64 = -13.280681552885721
+
+  let c1: F64 = -0.0077848940024302926
+  let c2: F64 = -0.32239645804113648
+  let c3: F64 = -2.4007582771618381
+  let c4: F64 = -2.5497325393437338
+  let c5: F64 = 4.3746641414649678
+  let c6: F64 = 2.9381639826987831
+
+  let d1: F64 = 0.0077846957090414622
+  let d2: F64 = 0.32246712907003983
+  let d3: F64 = 2.4451341542729740
+  let d4: F64 = 3.7544086619074162
+
+  let p_low: F64 = 0.02425
+  let x: F64 = 0.0
+
+  if p < p_low {
+    let q: F64 = f64_sqrt(0.0 - 2.0 * f64_log(p))
+    x = (((((c1 * q + c2) * q + c3) * q + c4) * q + c5) * q + c6)
+        / ((((d1 * q + d2) * q + d3) * q + d4) * q + 1.0)
+  } else if p <= 1.0 - p_low {
+    let q: F64 = p - 0.5
+    let rr: F64 = q * q
+    x = (((((a1 * rr + a2) * rr + a3) * rr + a4) * rr + a5) * rr + a6) * q
+        / (((((b1 * rr + b2) * rr + b3) * rr + b4) * rr + b5) * rr + 1.0)
+  } else {
+    let q: F64 = f64_sqrt(0.0 - 2.0 * f64_log(1.0 - p))
+    x = 0.0 - (((((c1 * q + c2) * q + c3) * q + c4) * q + c5) * q + c6)
+        / ((((d1 * q + d2) * q + d3) * q + d4) * q + 1.0)
+  }
+
+  x
+}
+
+# ---- rank normalisation -----------------------------------------------------
+#
+# R-hat as originally defined compares variances, and a variance is not defined
+# for a heavy-tailed posterior and is badly estimated for a skewed one. A Cauchy
+# posterior has no variance at all, so the classic R-hat on a Cauchy is a ratio
+# of two numbers that do not converge, and it reports whatever the largest draw
+# happened to be.
+#
+# Rank normalisation fixes this without assuming anything: pool every draw from
+# every chain, replace each by its rank, and map the ranks through the inverse
+# normal cdf. The result is exactly normal by construction whatever the
+# original distribution was, so the variance exists and R-hat means what it is
+# supposed to mean. Any monotone transformation of the parameter gives the same
+# answer, which is also a property the classic version does not have and should.
+#
+# The offsets 3/8 and 1/4 are the Blom plotting positions. They keep the
+# extreme ranks off 0 and 1, where the inverse cdf is infinite.
+
+fn rank_normalise(chains: Arr[Arr[F64]]) -> Arr[Arr[F64]] {
+  # Pool, keeping track of which chain and position each value came from.
+  let values: Arr[F64] = []
+  let i: I64 = 0
+  while i < len(chains) {
+    let j: I64 = 0
+    while j < len(chains[i]) {
+      push(values, chains[i][j])
+      j = j + 1
+    }
+    i = i + 1
+  }
+
+  let n: I64 = len(values)
+  let ranks: Arr[F64] = vec.zeros(n)
+
+  # Average ranks for ties. Ties are not exotic here: a chain that got stuck
+  # repeats the same value, and giving those repeats different ranks would hide
+  # exactly the pathology the diagnostic is looking for.
+  let k: I64 = 0
+  while k < n {
+    let less: I64 = 0
+    let equal: I64 = 0
+    let m: I64 = 0
+    while m < n {
+      if values[m] < values[k] {
+        less = less + 1
+      } else if values[m] == values[k] {
+        equal = equal + 1
+      }
+      m = m + 1
+    }
+    # One-based average rank of the tied group.
+    ranks[k] = f64_of_i64(less) + 0.5 * f64_of_i64(equal + 1)
+    k = k + 1
+  }
+
+  let out: Arr[Arr[F64]] = []
+  let pos: I64 = 0
+  i = 0
+  while i < len(chains) {
+    let series: Arr[F64] = []
+    let j: I64 = 0
+    while j < len(chains[i]) {
+      let p: F64 = (ranks[pos] - 0.375) / (f64_of_i64(n) + 0.25)
+      push(series, inv_normal_cdf(p))
+      pos = pos + 1
+      j = j + 1
+    }
+    push(out, series)
+    i = i + 1
+  }
+  out
+}
+
+# ---- split chains -----------------------------------------------------------
+#
+# Every chain is cut in half and the halves are treated as separate chains.
+#
+# Without the split, R-hat compares chains against each other and is blind to a
+# chain that is drifting: four chains all sliding slowly in the same direction
+# agree with each other at every moment, so the between-chain variance stays
+# small and R-hat reports 1.00 for a run that has not converged at all. Cutting
+# each chain in half makes the drift a disagreement between the first and
+# second halves of the same chain, which is exactly what it is.
+#
+# An odd-length chain drops its middle draw rather than putting it in one half.
+# The alternative biases one half by one draw, which is nothing numerically and
+# is a difference between two halves that are supposed to be exchangeable.
+
+fn split_chains(chains: Arr[Arr[F64]]) -> Arr[Arr[F64]] {
+  let out: Arr[Arr[F64]] = []
+  let i: I64 = 0
+  while i < len(chains) {
+    let n: I64 = len(chains[i])
+    let half: I64 = n / 2
+    let a: Arr[F64] = []
+    let b: Arr[F64] = []
+    let j: I64 = 0
+    while j < half {
+      push(a, chains[i][j])
+      j = j + 1
+    }
+    j = n - half
+    while j < n {
+      push(b, chains[i][j])
+      j = j + 1
+    }
+    push(out, a)
+    push(out, b)
+    i = i + 1
+  }
+  out
+}
+
+# ---- R-hat ------------------------------------------------------------------
+#
+#   W          the average of the within-chain variances
+#   B          n times the variance of the chain means
+#   var_hat    ((n-1)/n) W + B/n, an overestimate of the target variance if the
+#              chains have not mixed and an unbiased one if they have
+#   R-hat      sqrt(var_hat / W)
+#
+# The interpretation: W underestimates the target variance while the chains are
+# still exploring, because each chain has only seen part of the posterior.
+# var_hat overestimates it, because the between-chain spread includes the
+# chains not having converged. They meet at one from above as the chains mix.
+#
+# THE THRESHOLD
+#
+# 1.01, not 1.1. The 1.1 threshold is from the original 1992 paper and it is
+# far too loose: an R-hat of 1.05 corresponds to a bias in the posterior mean
+# that is a substantial fraction of the standard error, which is the whole
+# quantity anyone reports. Nothing above 1.01 should be used.
+#
+# WHAT IT CANNOT DO
+#
+# R-hat detects chains disagreeing. Four chains that all found the same wrong
+# mode agree perfectly and R-hat is 1.00. It is a necessary condition for
+# convergence and never a sufficient one, and this is why heddle also reports
+# divergences, which come from a different direction entirely.
+
+fn rhat(chains: Arr[Arr[F64]]) -> F64 {
+  let split: Arr[Arr[F64]] = split_chains(rank_normalise(chains))
+  let m: I64 = len(split)
+  if m < 2 {
+    return 0.0
+  }
+  let n: I64 = len(split[0])
+  if n < 2 {
+    return 0.0
+  }
+
+  let means: Arr[F64] = []
+  let within: F64 = 0.0
+  let i: I64 = 0
+  while i < m {
+    push(means, mean_of(split[i]))
+    within = within + var_of(split[i])
+    i = i + 1
+  }
+  let w: F64 = within / f64_of_i64(m)
+  if w <= 0.0 {
+    # Every chain is a constant. That is either a perfectly determined
+    # parameter or a completely stuck sampler, and R-hat cannot tell them
+    # apart. Returning 0 marks it as undefined rather than reporting the 1.0
+    # that a zero-over-zero would produce and that a reader would trust.
+    return 0.0
+  }
+
+  let b: F64 = f64_of_i64(n) * var_of(means)
+  let var_hat: F64 = f64_of_i64(n - 1) / f64_of_i64(n) * w + b / f64_of_i64(n)
+  f64_sqrt(var_hat / w)
+}
+
+# ---- effective sample size --------------------------------------------------
+#
+# Draws from a Markov chain are correlated, so N draws carry less information
+# than N independent ones. The effective sample size is how many independent
+# draws they are worth:
+#
+#   ESS = N / tau,   tau = 1 + 2 * sum_t rho_t
+#
+# where rho_t is the autocorrelation at lag t, estimated across chains.
+#
+# THE SUM HAS TO BE TRUNCATED AND THE TRUNCATION IS THE WHOLE PROBLEM
+#
+# The estimated rho_t is noise for large t, and the noise does not shrink with
+# N because there are fewer and fewer pairs at each lag. Summing all of them
+# adds up N/2 noise terms and gives an ESS that is dominated by them, commonly
+# negative.
+#
+# Geyer's initial monotone positive sequence is the answer used here. It rests
+# on a fact about reversible Markov chains: the sum of consecutive pairs
+# rho_{2k} + rho_{2k+1} is positive and decreasing in k. So the truncation rule
+# is not a heuristic cutoff, it is a check for where the estimate stops
+# obeying a property the true value has:
+#
+#   1. Sum in pairs.
+#   2. Stop at the first pair that is not positive. Beyond there the estimate
+#      has left the region where it can be trusted.
+#   3. Force the retained pairs to be decreasing, by clipping each to the
+#      minimum of itself and its predecessor. Non-monotonicity is estimation
+#      noise and clipping it can only make the ESS more conservative.
+#
+# A simpler cutoff, such as stopping at the first negative rho_t, is what most
+# hand-written implementations use and it terminates too early on a chain with
+# a slow oscillation, overstating the ESS by a factor of several.
+#
+# THE FLOOR
+#
+# ESS is compared against the number of draws, not against a fixed number. The
+# rule worth applying is roughly 100 per chain: below that the estimate of the
+# ESS is itself too noisy to act on. `summary` prints ESS beside N so the
+# comparison is available rather than implied.
+
+fn autocov(xs: Arr[F64], m: F64, lag: I64) -> F64 {
+  let n: I64 = len(xs)
+  let s: F64 = 0.0
+  let i: I64 = 0
+  while i + lag < n {
+    s = s + (xs[i] - m) * (xs[i + lag] - m)
+    i = i + 1
+  }
+  # Divided by n rather than by the number of pairs. The biased estimator is
+  # deliberate: it shrinks the high-lag terms toward zero, which is where the
+  # noise is, and it is what makes the resulting sequence better behaved. The
+  # unbiased version has larger variance exactly where the truncation rule has
+  # to make its decision.
+  s / f64_of_i64(n)
+}
+
+fn ess(chains: Arr[Arr[F64]]) -> F64 {
+  let split: Arr[Arr[F64]] = split_chains(rank_normalise(chains))
+  let m: I64 = len(split)
+  if m < 2 {
+    return 0.0
+  }
+  let n: I64 = len(split[0])
+  if n < 4 {
+    return 0.0
+  }
+
+  let means: Arr[F64] = []
+  let within: F64 = 0.0
+  let i: I64 = 0
+  while i < m {
+    push(means, mean_of(split[i]))
+    within = within + var_of(split[i])
+    i = i + 1
+  }
+  let w: F64 = within / f64_of_i64(m)
+  if w <= 0.0 {
+    return 0.0
+  }
+  let b: F64 = f64_of_i64(n) * var_of(means)
+  let var_hat: F64 = f64_of_i64(n - 1) / f64_of_i64(n) * w + b / f64_of_i64(n)
+
+  # The pooled autocorrelation at each lag. The within-chain autocovariances
+  # are averaged and then referred to var_hat, so the estimate accounts for the
+  # between-chain variance as well: chains that disagree have a low ESS even if
+  # each of them is individually well mixed, which is correct, because their
+  # disagreement is information about how far from converged they are.
+  let rho: Arr[F64] = []
+  let max_lag: I64 = n - 1
+  if max_lag > 500 {
+    max_lag = 500
+  }
+
+  let t: I64 = 1
+  while t <= max_lag {
+    let acov: F64 = 0.0
+    i = 0
+    while i < m {
+      acov = acov + autocov(split[i], means[i], t)
+      i = i + 1
+    }
+    acov = acov / f64_of_i64(m)
+    push(rho, 1.0 - (w - acov) / var_hat)
+    t = t + 1
+  }
+
+  # Geyer's initial monotone positive sequence over the paired sums.
+  let sum_pairs: F64 = 0.0
+  let prev_pair: F64 = 1.0e308
+  let k: I64 = 0
+  while 2 * k + 1 < len(rho) {
+    let pair: F64 = rho[2 * k] + rho[2 * k + 1]
+    if pair <= 0.0 {
+      k = len(rho)
+    } else {
+      if pair > prev_pair {
+        pair = prev_pair
+      }
+      prev_pair = pair
+      sum_pairs = sum_pairs + pair
+      k = k + 1
+    }
+  }
+
+  let tau: F64 = 1.0 + 2.0 * sum_pairs
+  if tau < 1.0 {
+    # An anti-correlated chain can genuinely beat independence, which HMC does
+    # routinely because its trajectories are designed to move away. The floor
+    # is on tau, not on the ESS, and it is set at 1/log10(N) rather than at 1,
+    # so a real antithetic gain is kept and an implausible one is not.
+    let floor: F64 = 1.0 / (f64_log(f64_of_i64(m * n)) / 2.302585092994046)
+    if tau < floor {
+      tau = floor
+    }
+  }
+
+  f64_of_i64(m * n) / tau
+}
+
+# The Monte Carlo standard error of the posterior mean: the uncertainty in the
+# estimate that comes from having run a finite chain, as opposed to the
+# posterior standard deviation, which is the uncertainty about the parameter.
+#
+# The two get confused constantly and they answer different questions. The
+# posterior sd does not shrink with more draws. The MCSE does, as 1/sqrt(ESS),
+# and it is what says whether the reported mean has enough digits to quote.
+fn mcse_mean(chains: Arr[Arr[F64]]) -> F64 {
+  let e: F64 = ess(chains)
+  if e <= 0.0 {
+    return 0.0
+  }
+  let pooled: Arr[F64] = []
+  let i: I64 = 0
+  while i < len(chains) {
+    let j: I64 = 0
+    while j < len(chains[i]) {
+      push(pooled, chains[i][j])
+      j = j + 1
+    }
+    i = i + 1
+  }
+  sd_of(pooled) / f64_sqrt(e)
+}
+
+# ---- the summary ------------------------------------------------------------
+
+struct ParamSummary {
+  name: Str,
+  mean: F64,
+  sd: F64,
+  q5: F64,
+  q50: F64,
+  q95: F64,
+  mcse: F64,
+  ess: F64,
+  rhat: F64,
+}
+
+fn summarise(cs: Arr[chain.Chain], names: Arr[Str]) -> Arr[ParamSummary] {
+  let out: Arr[ParamSummary] = []
+  if len(cs) == 0 {
+    return out
+  }
+  let d: I64 = chain.dim_of(cs[0])
+
+  let k: I64 = 0
+  while k < d {
+    let per_chain: Arr[Arr[F64]] = chain.columns(cs, k)
+    let pooled: Arr[F64] = []
+    let i: I64 = 0
+    while i < len(per_chain) {
+      let j: I64 = 0
+      while j < len(per_chain[i]) {
+        push(pooled, per_chain[i][j])
+        j = j + 1
+      }
+      i = i + 1
+    }
+    let s: Arr[F64] = sorted_copy(pooled)
+
+    let name: Str = "theta[" + str(k + 1) + "]"
+    if k < len(names) {
+      name = names[k]
+    }
+
+    push(out, ParamSummary {
+      name: name,
+      mean: mean_of(pooled),
+      sd: sd_of(pooled),
+      q5: quantile_sorted(s, 0.05),
+      q50: quantile_sorted(s, 0.5),
+      q95: quantile_sorted(s, 0.95),
+      mcse: mcse_mean(per_chain),
+      ess: ess(per_chain),
+      rhat: rhat(per_chain),
+    })
+    k = k + 1
+  }
+  out
+}
+
+# The warnings, as sentences.
+#
+# Returned as an array of strings rather than printed, so a caller can put them
+# in a report, fail a test on a non-empty result, or refuse to write a result
+# file. An empty array means every check passed, which is the only thing worth
+# treating as success.
+fn warnings(cs: Arr[chain.Chain], summaries: Arr[ParamSummary], max_depth: I64) -> Arr[Str] {
+  let out: Arr[Str] = []
+
+  let n_div: I64 = chain.total_divergences(cs)
+  if n_div > 0 {
+    let total: I64 = chain.total_draws(cs)
+    push(out, "heddle: " + str(n_div) + " of " + str(total)
+      + " transitions diverged. The posterior is biased, not merely noisy:"
+      + " divergences happen in a specific region, so that region is"
+      + " under-sampled. Raise target_accept above 0.9, or reparameterise.")
+  }
+
+  let n_max: I64 = chain.total_max_depth(cs)
+  if n_max > 0 {
+    push(out, "heddle: " + str(n_max) + " transitions hit the maximum tree depth of "
+      + str(max_depth) + ". The sampler ran out of trajectory before it turned,"
+      + " which costs efficiency rather than correctness. It usually means one"
+      + " posterior direction is far wider than the step size can cross.")
+  }
+
+  let worst_rhat: F64 = 0.0
+  let worst_name: Str = ""
+  let low_ess: I64 = 0
+  let i: I64 = 0
+  while i < len(summaries) {
+    if summaries[i].rhat > worst_rhat {
+      worst_rhat = summaries[i].rhat
+      worst_name = summaries[i].name
+    }
+    if summaries[i].ess < 100.0 * f64_of_i64(len(cs)) {
+      low_ess = low_ess + 1
+    }
+    i = i + 1
+  }
+
+  if worst_rhat > 1.01 {
+    push(out, "heddle: R-hat is " + str(worst_rhat) + " for " + worst_name
+      + ", above 1.01. The chains have not converged to the same distribution."
+      + " Nothing in this summary should be used.")
+  }
+
+  if low_ess > 0 {
+    push(out, "heddle: " + str(low_ess) + " parameters have an effective sample size"
+      + " below 100 per chain. The estimate of the effective sample size is"
+      + " itself unreliable there, so the reported standard errors are"
+      + " optimistic. Draw more.")
+  }
+
+  out
+}

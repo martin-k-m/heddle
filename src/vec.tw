@@ -1,0 +1,216 @@
+mode systems
+
+# vec.tw: flat real vectors, and the one place heddle crosses into the tensor
+# half of the language.
+#
+# WHY THERE IS A SEAM AT ALL
+#
+# A sampler's state is a point in R^n and a momentum in R^n. Everything a
+# sampler does to those is scalar arithmetic in a loop: add, scale, dot,
+# elementwise multiply by a mass vector. None of it wants a shape, a broadcast
+# rule, or a gradient tape. `Arr[F64]` is the right carrier and it is what
+# `std/stats.tw` and `std/random.tw` already speak.
+#
+# The gradient is the exception. `grad` is a builtin over tensors, and a
+# tensor is the only value twill will differentiate. So the log density is
+# written as a function of a `Tensor` and the sampler converts at exactly two
+# points per gradient evaluation: in on the position, out on the gradient.
+#
+# Isolating the crossing here rather than spreading tensors through the
+# samplers is deliberate. A leapfrog written on tensors would allocate a tape
+# node for every half step, and the tape would then hold the whole trajectory
+# alive for a NUTS tree of depth ten, which is a thousand positions. The tape
+# is for the density, not for the integrator.
+#
+# The two conversions below are the whole seam. Both are named in
+# docs/needs.md, because neither exists yet.
+
+# ---- construction ----------------------------------------------------------
+
+fn zeros(n: I64) -> Arr[F64] {
+  let xs: Arr[F64] = []
+  let i: I64 = 0
+  while i < n {
+    push(xs, 0.0)
+    i = i + 1
+  }
+  xs
+}
+
+fn filled(n: I64, v: F64) -> Arr[F64] {
+  let xs: Arr[F64] = []
+  let i: I64 = 0
+  while i < n {
+    push(xs, v)
+    i = i + 1
+  }
+  xs
+}
+
+fn ones(n: I64) -> Arr[F64] = filled(n, 1.0)
+
+# A copy. `Arr` parameters alias the caller's array (twill NEEDS-71), so any
+# function here that would otherwise write through its argument copies first.
+# The samplers rely on this: a proposal that mutated the current position in
+# place would corrupt the chain on rejection, and the corruption would look
+# like a mixing problem rather than a bug.
+fn copy(xs: Arr[F64]) -> Arr[F64] {
+  let out: Arr[F64] = []
+  let i: I64 = 0
+  while i < len(xs) {
+    push(out, xs[i])
+    i = i + 1
+  }
+  out
+}
+
+# ---- arithmetic ------------------------------------------------------------
+
+fn add(a: Arr[F64], b: Arr[F64]) -> Arr[F64] {
+  let out: Arr[F64] = []
+  let i: I64 = 0
+  while i < len(a) {
+    push(out, a[i] + b[i])
+    i = i + 1
+  }
+  out
+}
+
+fn sub(a: Arr[F64], b: Arr[F64]) -> Arr[F64] {
+  let out: Arr[F64] = []
+  let i: I64 = 0
+  while i < len(a) {
+    push(out, a[i] - b[i])
+    i = i + 1
+  }
+  out
+}
+
+fn scale(a: Arr[F64], k: F64) -> Arr[F64] {
+  let out: Arr[F64] = []
+  let i: I64 = 0
+  while i < len(a) {
+    push(out, a[i] * k)
+    i = i + 1
+  }
+  out
+}
+
+fn mul(a: Arr[F64], b: Arr[F64]) -> Arr[F64] {
+  let out: Arr[F64] = []
+  let i: I64 = 0
+  while i < len(a) {
+    push(out, a[i] * b[i])
+    i = i + 1
+  }
+  out
+}
+
+# a + k * b, in one pass. The leapfrog is three of these and nothing else, and
+# writing it as `add(a, scale(b, k))` allocates a throwaway array per half step.
+fn axpy(a: Arr[F64], k: F64, b: Arr[F64]) -> Arr[F64] {
+  let out: Arr[F64] = []
+  let i: I64 = 0
+  while i < len(a) {
+    push(out, a[i] + k * b[i])
+    i = i + 1
+  }
+  out
+}
+
+fn dot(a: Arr[F64], b: Arr[F64]) -> F64 {
+  let s: F64 = 0.0
+  let i: I64 = 0
+  while i < len(a) {
+    s = s + a[i] * b[i]
+    i = i + 1
+  }
+  s
+}
+
+# The kinetic energy of a momentum under a diagonal mass matrix, which is
+# 0.5 * p' M^-1 p. `inv_mass` holds the diagonal of M^-1, not of M, because
+# that is the form every use of it takes and storing M would mean dividing
+# inside the leapfrog's inner loop.
+fn quad_form(p: Arr[F64], inv_mass: Arr[F64]) -> F64 {
+  let s: F64 = 0.0
+  let i: I64 = 0
+  while i < len(p) {
+    s = s + p[i] * p[i] * inv_mass[i]
+    i = i + 1
+  }
+  0.5 * s
+}
+
+fn norm2(a: Arr[F64]) -> F64 = dot(a, a)
+
+fn max_abs(a: Arr[F64]) -> F64 {
+  let m: F64 = 0.0
+  let i: I64 = 0
+  while i < len(a) {
+    let v: F64 = a[i]
+    if v < 0.0 {
+      v = 0.0 - v
+    }
+    if v > m {
+      m = v
+    }
+    i = i + 1
+  }
+  m
+}
+
+# Whether every element is a finite number. A sampler that lets a NaN into the
+# position never recovers: every subsequent acceptance ratio is NaN, every
+# comparison against it is false, and the chain silently freezes at the last
+# good point while continuing to report draws. Checking is cheaper than
+# explaining the resulting posterior.
+fn all_finite(a: Arr[F64]) -> Bool {
+  let i: I64 = 0
+  while i < len(a) {
+    let v: F64 = a[i]
+    # A NaN is the only value not equal to itself, and an infinity fails the
+    # bound. Both are caught without a dedicated predicate, which twill does
+    # not have.
+    if not (v == v) {
+      return false
+    }
+    if v > 1.0e300 or v < -1.0e300 {
+      return false
+    }
+    i = i + 1
+  }
+  true
+}
+
+fn is_finite(x: F64) -> Bool {
+  if not (x == x) {
+    return false
+  }
+  x < 1.0e300 and x > -1.0e300
+}
+
+# ---- the seam --------------------------------------------------------------
+
+# An `Arr[F64]` as a rank-1 tensor of the same length, and back.
+#
+# Neither of these exists in twill today. `tensor(list)` builds a tensor from a
+# numeric-mode list, and a systems-mode `Arr[F64]` is not that list. Going the
+# other way, indexing a rank-1 tensor yields a rank-0 tensor and `item` yields
+# its scalar, but neither is spelled for a systems-mode `F64`. docs/needs.md
+# entries 4 and 5.
+#
+# heddle writes them as if they existed because every alternative is worse.
+# Writing the samplers on tensors instead would put the integrator on the tape.
+# Writing the densities on `Arr[F64]` instead would mean writing a backward
+# pass for every distribution by hand, which is precisely the work `grad`
+# exists to remove and precisely the work a probabilistic programming library
+# should not be reintroducing.
+fn to_tensor(xs: Arr[F64]) -> Tensor = tensor_of_arr(xs)
+
+fn of_tensor(t: Tensor) -> Arr[F64] = arr_of_tensor(t)
+
+# A rank-0 tensor as a scalar. Separate from `of_tensor` because a log density
+# returns one number and unwrapping it through a one-element array would be a
+# lie about the shape.
+fn scalar_of(t: Tensor) -> F64 = item(t)

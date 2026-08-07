@@ -1,0 +1,9 @@
+# Written by spool. Reproduced from spool.toml and spool.lock, so it is not
+# source and does not belong in a commit.
+twill_modules/
+.spool/
+
+# Draws and diagnostics a run writes.
+posterior/
+*.draws
+*.ncdf

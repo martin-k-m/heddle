@@ -1,0 +1,16 @@
+# heddle, read by spool. The subset spool parses is comments, one-level tables,
+# quoted strings and single-line inline tables, and this file stays inside it.
+name = "heddle"
+version = "0.1.0"
+
+# Documentation only. twill has no package entry point, so spool records this
+# and shows it in `spool list`; it does not enforce it.
+entry = "src/nuts.tw"
+
+[dependencies]
+# The language itself, pinned to the release whose std/random, std/nn and
+# differentiation builtins this source was written against. spool has no notion
+# of a toolchain dependency, so it is declared as an ordinary git dependency:
+# the version is the thing that matters and vendoring the twill tree does no
+# harm.
+twill = { version = "^1.2.0", git = "https://github.com/martin-k-m/twill" }

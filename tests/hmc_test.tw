@@ -1,0 +1,200 @@
+mode systems
+
+import "harness.tw" as t
+import "../src/hmc.tw" as hmc
+import "../src/vec.tw" as vec
+import "../src/dist.tw" as dist
+
+import "std/random" as random
+
+# A standard normal target in two dimensions. Its log density is
+# -0.5 * sum(q^2), its gradient is -q, and every moment is known, which is what
+# makes it the right target for testing an integrator.
+fn std_normal(q: Tensor) -> Tensor = dist.normal_log_prob(q, scalar(0.0), scalar(1.0))
+
+# ---- the leapfrog -----------------------------------------------------------
+#
+# Two properties, and the Metropolis correction is invalid without either.
+
+# REVERSIBILITY. Stepping forward by eps and then backward by eps from the
+# negated momentum returns to the start. This is the property that makes the
+# proposal symmetric, so the Hastings ratio is one and the acceptance rule is
+# the plain density ratio. An integrator that is not reversible gives a sampler
+# that runs, mixes, and targets something other than the posterior.
+fn a_leapfrog_step_is_reversible() {
+  let inv_mass: Arr[F64] = vec.ones(2)
+  let q0: Arr[F64] = [0.7, -1.3]
+  let p0: Arr[F64] = [0.4, 0.9]
+
+  let a: hmc.Point = hmc.point_at(std_normal, vec.copy(q0), vec.copy(p0))
+  let b: hmc.Point = hmc.leapfrog(std_normal, a, 0.1, inv_mass)
+
+  # Negate the momentum and step again with the same positive step size. The
+  # leapfrog's symmetry means this is the inverse.
+  let flipped: hmc.Point = hmc.Point {
+    q: b.q, p: vec.scale(b.p, -1.0), grad: b.grad, logp: b.logp,
+  }
+  let c: hmc.Point = hmc.leapfrog(std_normal, flipped, 0.1, inv_mass)
+
+  t.near("reversed position, coordinate 0", c.q[0], q0[0], 0.000000000001)
+  t.near("reversed position, coordinate 1", c.q[1], q0[1], 0.000000000001)
+  t.near("reversed momentum, coordinate 0", 0.0 - c.p[0], p0[0], 0.000000000001)
+  t.near("reversed momentum, coordinate 1", 0.0 - c.p[1], p0[1], 0.000000000001)
+}
+
+# ENERGY CONSERVATION. The exact dynamics conserve H. The leapfrog does not,
+# but its error is bounded and oscillatory rather than accumulating, which is
+# what makes long trajectories possible at all. A first-order integrator's
+# error grows without bound and the trajectory spirals away.
+#
+# The bound tested here, 1e-3 over a hundred steps at eps = 0.05, is what a
+# second-order symplectic integrator gives on this target. An Euler step
+# written by mistake would be off by more than an order of magnitude.
+fn the_leapfrog_conserves_energy_over_a_long_trajectory() {
+  let inv_mass: Arr[F64] = vec.ones(2)
+  let start: hmc.Point = hmc.point_at(std_normal, [0.5, -0.5], [1.0, 0.3])
+  let h0: F64 = hmc.neg_energy(start, inv_mass)
+
+  let cur: hmc.Point = start
+  let worst: F64 = 0.0
+  let i: I64 = 0
+  while i < 100 {
+    cur = hmc.leapfrog(std_normal, cur, 0.05, inv_mass)
+    let d: F64 = hmc.neg_energy(cur, inv_mass) - h0
+    if d < 0.0 {
+      d = 0.0 - d
+    }
+    if d > worst {
+      worst = d
+    }
+    i = i + 1
+  }
+  t.check("the energy error stays small over 100 steps", worst < 0.001)
+}
+
+# The step size is what controls the error, quadratically. Halving it should
+# cut the error by roughly four, and a linear reduction would mean the
+# integrator is first order and the half steps are not doing what they look
+# like they are doing.
+fn the_leapfrog_error_is_second_order_in_the_step_size() {
+  let inv_mass: Arr[F64] = vec.ones(2)
+
+  let e1: F64 = trajectory_error(0.2, 10, inv_mass)
+  let e2: F64 = trajectory_error(0.1, 20, inv_mass)
+
+  # Second order means a ratio near 4. The bracket is wide because the error is
+  # oscillatory and the endpoint is not its peak.
+  let ratio: F64 = e1 / e2
+  t.check("halving the step cuts the energy error by about four",
+    ratio > 3.0 and ratio < 5.5)
+}
+
+fn trajectory_error(eps: F64, steps: I64, inv_mass: Arr[F64]) -> F64 {
+  let start: hmc.Point = hmc.point_at(std_normal, [0.5, -0.5], [1.0, 0.3])
+  let h0: F64 = hmc.neg_energy(start, inv_mass)
+  let cur: hmc.Point = start
+  let i: I64 = 0
+  while i < steps {
+    cur = hmc.leapfrog(std_normal, cur, eps, inv_mass)
+    i = i + 1
+  }
+  let d: F64 = hmc.neg_energy(cur, inv_mass) - h0
+  if d < 0.0 {
+    d = 0.0 - d
+  }
+  d
+}
+
+# The gradient sign. A particle released at rest away from the mode must fall
+# toward it. This catches the single most consequential sign error in the file,
+# which otherwise shows up as a chain that flies apart and gets blamed on the
+# step size.
+fn a_particle_released_at_rest_moves_toward_the_mode() {
+  let inv_mass: Arr[F64] = vec.ones(2)
+  let start: hmc.Point = hmc.point_at(std_normal, [3.0, 0.0], [0.0, 0.0])
+  let after: hmc.Point = hmc.leapfrog(std_normal, start, 0.1, inv_mass)
+  t.check("the position moved toward zero", after.q[0] < 3.0)
+  t.check("but did not overshoot in one small step", after.q[0] > 2.9)
+}
+
+# ---- the momentum -----------------------------------------------------------
+#
+# p ~ N(0, M) and inv_mass is the diagonal of M^-1, so a large inv_mass means a
+# small momentum. Getting this backwards is invisible with an identity metric
+# and breaks the sampler as soon as mass adaptation does anything.
+fn the_momentum_variance_is_the_inverse_of_the_inverse_mass() {
+  let r: random.Rng = random.new_rng(20260807)
+  let inv_mass: Arr[F64] = [4.0, 0.25]
+  let n: I64 = 40000
+  let s0: F64 = 0.0
+  let s1: F64 = 0.0
+  let i: I64 = 0
+  while i < n {
+    let p: Arr[F64] = hmc.draw_momentum(r, inv_mass)
+    s0 = s0 + p[0] * p[0]
+    s1 = s1 + p[1] * p[1]
+    i = i + 1
+  }
+  t.near("coordinate 0 has variance 1/4", s0 / f64_of_i64(n), 0.25, 0.01)
+  t.near("coordinate 1 has variance 4", s1 / f64_of_i64(n), 4.0, 0.15)
+}
+
+# ---- divergence -------------------------------------------------------------
+
+fn a_finite_energy_error_is_not_a_divergence() {
+  t.check("a small error is fine", not hmc.is_divergent(0.0, -3.0))
+  t.check("even a large but bounded one", not hmc.is_divergent(0.0, -900.0))
+}
+
+fn a_runaway_energy_error_is_a_divergence() {
+  t.check("past the threshold", hmc.is_divergent(0.0, -1001.0))
+}
+
+fn a_non_finite_energy_is_a_divergence() {
+  # The case that matters in practice: the integrator stepped outside the
+  # support and the density came back as a NaN.
+  let nan: F64 = 0.0 / 0.0
+  t.check("a NaN energy diverges", hmc.is_divergent(0.0, nan))
+}
+
+# ---- static HMC -------------------------------------------------------------
+
+fn static_hmc_recovers_the_standard_normal() {
+  let r: random.Rng = random.new_rng(4242)
+  let inv_mass: Arr[F64] = vec.ones(2)
+  let q: Arr[F64] = [0.0, 0.0]
+
+  let n: I64 = 4000
+  let s: F64 = 0.0
+  let s2: F64 = 0.0
+  let accepted: I64 = 0
+
+  let i: I64 = 0
+  while i < n {
+    let res = hmc.hmc_draw(std_normal, r, q, 0.25, 12, inv_mass)
+    q = res.q
+    if res.accepted {
+      accepted = accepted + 1
+    }
+    s = s + q[0]
+    s2 = s2 + q[0] * q[0]
+    i = i + 1
+  }
+
+  let m: F64 = s / f64_of_i64(n)
+  t.near("the posterior mean is zero", m, 0.0, 0.06)
+  t.near("the posterior variance is one", s2 / f64_of_i64(n) - m * m, 1.0, 0.08)
+  t.check("most proposals were accepted", accepted > 3400)
+}
+
+a_leapfrog_step_is_reversible()
+the_leapfrog_conserves_energy_over_a_long_trajectory()
+the_leapfrog_error_is_second_order_in_the_step_size()
+a_particle_released_at_rest_moves_toward_the_mode()
+the_momentum_variance_is_the_inverse_of_the_inverse_mass()
+a_finite_energy_error_is_not_a_divergence()
+a_runaway_energy_error_is_a_divergence()
+a_non_finite_energy_is_a_divergence()
+static_hmc_recovers_the_standard_normal()
+
+t.report("heddle hmc")

@@ -1,0 +1,202 @@
+mode systems
+
+# model.tw: what a model is, and how the samplers see it.
+#
+# A MODEL IS A FUNCTION
+#
+#   fn logp(q: Tensor) -> Tensor
+#
+# One argument, the unconstrained parameter vector. One result, a rank-0 tensor
+# holding the log of the unnormalised posterior at that point. That is the
+# entire interface. There is no model object, no graph, no registry, no
+# `sample` statement, no tracing pass, and no domain-specific language.
+#
+# WHY THAT IS THE WHOLE INTERFACE
+#
+# Every probabilistic programming system needs the gradient of the log
+# posterior. Systems built on frameworks without differentiation get it by
+# building a second representation of the user's program: a trace, a graph, a
+# tape recorded through overloaded operators, a set of `sample` and `observe`
+# effects interpreted by a handler. That representation is the framework's real
+# language, and it is where the friction lives. Control flow that the tracer
+# cannot see is silently wrong. A parameter used twice is recorded twice. A
+# model that calls a library function the tracer does not recognise stops
+# differentiating and reports a zero.
+#
+# twill differentiates ordinary twill. `grad(logp)` is the gradient of the log
+# posterior, for any `logp` a user can write, including one with a `while` loop
+# in it, one that calls `std/nn`, and one that calls another package. There is
+# nothing to trace because there is no second representation. A model is a
+# function, composition of models is composition of functions, and a
+# reparameterised model is a function that calls the first one.
+#
+# The consequence worth stating: heddle is small. It is a set of distributions,
+# a set of transforms, and three samplers. It is small because the hard part,
+# the derivative of an arbitrary user program, is the language's job and the
+# language does it.
+#
+# WHAT THIS FILE ADDS
+#
+# Two things the samplers need and a model writer should not have to build:
+# the crossing from the sampler's `Arr[F64]` to the density's `Tensor` and
+# back, and a layout so a flat vector can be read by name.
+
+import "src/vec.tw" as vec
+
+# ---- evaluating the density -------------------------------------------------
+
+# The value and the gradient of the log posterior at one point.
+#
+# Returned together, from one call to `value_and_grad`, because a reverse-mode
+# pass computes both and asking separately doubles the cost of every leapfrog
+# step. NUTS at tree depth 10 takes 1023 gradient evaluations per draw, so a
+# factor of two here is a factor of two in the whole run.
+struct LogDensity {
+  value: F64,
+  grad: Arr[F64],
+}
+
+fn value_and_gradient(logp: fn(Tensor) -> Tensor, q: Arr[F64]) -> LogDensity {
+  let t: Tensor = vec.to_tensor(q)
+  let vg = value_and_grad(logp)(t)
+  LogDensity { value: vec.scalar_of(vg[0]), grad: vec.of_tensor(vg[1]) }
+}
+
+fn log_density(logp: fn(Tensor) -> Tensor, q: Arr[F64]) -> F64 =
+  vec.scalar_of(logp(vec.to_tensor(q)))
+
+# A point outside the support. Every sampler treats a non-finite log density as
+# a rejection rather than as an error.
+#
+# This is the correct behaviour and it is worth being precise about why. A
+# density of -inf means the proposal has zero posterior probability, which is a
+# perfectly ordinary thing for a proposal to be, and rejecting it is exactly
+# what the Metropolis rule says to do. A NaN means something else: an overflow,
+# a log of a negative number, a 0/0. Treating a NaN as a rejection is a
+# judgement call, and heddle makes it because the alternative is aborting a
+# four-hour run at draw 300,000. What heddle will not do is treat it as
+# silence: `src/diag.tw` counts these and the summary prints the count, so a
+# model that is NaN half the time cannot look like a model that converged.
+fn is_usable(d: LogDensity) -> Bool {
+  if not vec.is_finite(d.value) {
+    return false
+  }
+  vec.all_finite(d.grad)
+}
+
+# ---- naming the coordinates -------------------------------------------------
+#
+# The sampler works on one flat vector. A model is written in terms of named
+# blocks: an intercept, a vector of coefficients, a scale, a group-level
+# offset. A `Layout` records where each block sits so the model can slice it by
+# name, and so the summary in `src/chain.tw` can label a column with something
+# better than `theta[7]`.
+#
+# The offsets are computed by the layout rather than written by the model
+# author. Hand-computed offsets are correct until a block is inserted, and the
+# failure after that is not a crash: the model reads the scale where the
+# intercept is, the posterior is nonsense, and nothing in the output says so.
+
+struct Layout {
+  names: Arr[Str],
+  offsets: Arr[I64],
+  sizes: Arr[I64],
+  total: I64,
+}
+
+fn new_layout() -> Layout {
+  let n: Arr[Str] = []
+  let o: Arr[I64] = []
+  let s: Arr[I64] = []
+  Layout { names: n, offsets: o, sizes: s, total: 0 }
+}
+
+# Append a block. Returns the error-string convention: empty on success. A
+# duplicate name is refused rather than shadowed, because a model with two
+# blocks called "sigma" has a bug and the second one silently winning is the
+# worst of the available outcomes.
+fn declare(l: Layout, name: Str, size: I64) -> Str {
+  if size <= 0 {
+    return "heddle: block " + name + " has size " + str(size) + ", which must be positive"
+  }
+  let i: I64 = 0
+  while i < len(l.names) {
+    if l.names[i] == name {
+      return "heddle: block " + name + " is declared twice"
+    }
+    i = i + 1
+  }
+  push(l.names, name)
+  push(l.offsets, l.total)
+  push(l.sizes, size)
+  l.total = l.total + size
+  ""
+}
+
+fn index_of(l: Layout, name: Str) -> I64 {
+  let i: I64 = 0
+  while i < len(l.names) {
+    if l.names[i] == name {
+      return i
+    }
+    i = i + 1
+  }
+  -1
+}
+
+# The block, as a tensor slice of the flat parameter vector.
+#
+# A slice rather than a copy, so the gradient flows back to the right
+# coordinates of `q`. twill's slicing is differentiable and scatters the
+# gradient to the selected rows, which is the property this whole scheme rests
+# on: a model that reads three blocks out of one vector and combines them gets
+# a gradient for the whole vector with no assembly step.
+fn block(l: Layout, q: Tensor, name: Str) -> Tensor {
+  let i: I64 = index_of(l, name)
+  let start: I64 = l.offsets[i]
+  q[start:start + l.sizes[i]]
+}
+
+# A single-element block as a rank-0 tensor. Distinct from `block`, which
+# returns a length-1 vector for a size-1 block. The difference matters: a
+# length-1 vector broadcast against a length-n vector is fine, and a length-1
+# vector used where a scalar was meant produces a shape that is right by
+# accident until n happens to be 1.
+fn scalar_block(l: Layout, q: Tensor, name: Str) -> Tensor {
+  let i: I64 = index_of(l, name)
+  q[l.offsets[i]]
+}
+
+# The same for a sampler's `Arr[F64]`, for reporting a constrained draw without
+# going through the tape.
+fn block_arr(l: Layout, q: Arr[F64], name: Str) -> Arr[F64] {
+  let i: I64 = index_of(l, name)
+  let out: Arr[F64] = []
+  let j: I64 = 0
+  while j < l.sizes[i] {
+    push(out, q[l.offsets[i] + j])
+    j = j + 1
+  }
+  out
+}
+
+# One label per coordinate, for the summary table. A size-1 block keeps its
+# bare name; a larger one gets an index suffix, one-based, because a reader
+# comparing against the model's own notation counts from one.
+fn coordinate_names(l: Layout) -> Arr[Str] {
+  let out: Arr[Str] = []
+  let i: I64 = 0
+  while i < len(l.names) {
+    if l.sizes[i] == 1 {
+      push(out, l.names[i])
+    } else {
+      let j: I64 = 0
+      while j < l.sizes[i] {
+        push(out, l.names[i] + "[" + str(j + 1) + "]")
+        j = j + 1
+      }
+    }
+    i = i + 1
+  }
+  out
+}

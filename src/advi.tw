@@ -1,0 +1,303 @@
+mode systems
+
+# advi.tw: automatic differentiation variational inference, mean field.
+#
+# WHAT IT DOES INSTEAD OF SAMPLING
+#
+# MCMC draws from the posterior. Variational inference gives up on that and
+# instead picks the closest member of a simple family of distributions, closest
+# in the Kullback-Leibler sense. It turns inference into optimisation, so it
+# finishes in seconds where NUTS takes minutes, and it scales to models where
+# NUTS does not finish at all.
+#
+# The family here is mean-field normal: independent normals on each
+# unconstrained coordinate, parameterised by a mean and a log standard
+# deviation.
+#
+#   q(theta) = product_i Normal(theta_i ; mu_i, exp(omega_i))
+#
+# THE OBJECTIVE
+#
+# Minimising KL(q || p) is the same as maximising the evidence lower bound:
+#
+#   ELBO(mu, omega) = E_q[ log p(theta) ] + H[q]
+#
+# where H[q] = sum(omega) + (d/2)(1 + log 2pi) is the entropy of the mean-field
+# normal, available in closed form because the family is simple. The first term
+# is an expectation with no closed form and is estimated by Monte Carlo.
+#
+# THE REPARAMETERISATION TRICK, WHICH IS THE WHOLE ALGORITHM
+#
+# The problem: the gradient wanted is d/d(mu, omega) of an expectation whose
+# distribution depends on mu and omega. Differentiating under the integral does
+# not work directly, because the thing being averaged over moves.
+#
+# The trick: write the draw as a deterministic function of fixed noise.
+#
+#   theta = mu + exp(omega) * eps,   eps ~ Normal(0, 1)
+#
+# Now the randomness is in eps, which does not depend on the parameters, and
+# the expectation is over a fixed distribution. So
+#
+#   grad E_eps[ log p(mu + exp(omega) * eps) ]
+#     = E_eps[ grad log p(mu + exp(omega) * eps) ]
+#
+# and a one-sample Monte Carlo estimate of the right-hand side is an unbiased
+# estimate of the gradient. The alternative, the score function or REINFORCE
+# estimator, is also unbiased and has variance larger by one to three orders of
+# magnitude, which is the difference between converging in a thousand steps and
+# not converging.
+#
+# In twill this is four lines. The function below takes mu and omega, builds
+# theta from them and a fixed eps, calls the user's log density, and adds the
+# entropy. `grads` of that function is the gradient of the ELBO with respect to
+# both variational parameters, and no part of that chain was written by hand.
+# A framework without differentiation has to implement the trick as machinery:
+# a distribution object that knows its own reparameterisation, a tracer that
+# recognises it, and a rule for propagating through it. Here it is an ordinary
+# expression whose derivative the language already knows.
+#
+# WHAT IT COSTS, SAID PLAINLY
+#
+# Mean field assumes the posterior coordinates are independent. They are not.
+# The consequence is not a small error: KL(q || p) penalises q putting mass
+# where p has none, and not the reverse, so the fitted q shrinks into the
+# posterior and systematically UNDERSTATES the variance. Posterior means come
+# out reasonable and credible intervals come out too narrow, often by a factor
+# of two or more on a correlated posterior.
+#
+# There is also no diagnostic here worth the name. R-hat and effective sample
+# size are about chains and there are none. The ELBO going flat says the
+# optimiser stopped, not that the answer is right, and two very different q's
+# can have nearly the same ELBO. `advi_fit` returns the ELBO history so a user
+# can see the optimisation, and `src/diag.tw` has nothing to offer about the
+# result. That is a real limitation and it is why NUTS is the default.
+#
+# Use this to find a starting point for NUTS, to iterate on a model quickly, or
+# where NUTS genuinely will not run. Do not use it for the number in the paper.
+
+import "std/random" as random
+import "src/vec.tw" as vec
+
+struct AdviConfig {
+  iterations: I64,
+  # Monte Carlo samples per gradient step. One is the classic choice and works
+  # because the optimiser averages over iterations anyway. More reduces the
+  # gradient noise per step at proportional cost, and is worth it for a model
+  # whose log density is cheap relative to the optimiser overhead.
+  mc_samples: I64,
+  eta: F64,
+  # The window over which convergence is judged, and the relative change below
+  # which it is declared.
+  window: I64,
+  tol: F64,
+  seed: I64,
+}
+
+fn advi_config(iterations: I64, seed: I64) -> AdviConfig =
+  AdviConfig {
+    iterations: iterations,
+    mc_samples: 1,
+    eta: 0.1,
+    window: 50,
+    tol: 0.01,
+    seed: seed,
+  }
+
+struct AdviResult {
+  mu: Arr[F64],
+  omega: Arr[F64],
+  elbo: Arr[F64],
+  iterations: I64,
+  converged: Bool,
+}
+
+let LOG_TWO_PI: F64 = 1.8378770664093453
+
+# The entropy of the mean-field normal. Closed form, so it contributes an exact
+# gradient rather than a Monte Carlo one, and the constant is kept because the
+# ELBO's absolute value is what a user compares between two models.
+fn entropy(omega: Tensor, d: I64) -> Tensor =
+  sum(omega) + 0.5 * f64_of_i64(d) * (1.0 + LOG_TWO_PI)
+
+# ---- the fit ----------------------------------------------------------------
+#
+# THE STEP SIZE SCHEDULE
+#
+# Adagrad with the ADVI paper's sequence:
+#
+#   s_n = alpha * g_n^2 + (1 - alpha) * s_{n-1}
+#   rho_n = eta * n^(-1/2 + 1e-16) / (tau + sqrt(s_n))
+#
+# The n^(-1/2) factor is a Robbins-Monro decay and is what makes the iterates
+# converge in the presence of gradient noise rather than bouncing around the
+# optimum forever. The per-coordinate 1/sqrt(s_n) is the adaptive part and it
+# is doing the same job the mass matrix does for NUTS: unconstrained
+# coordinates differ in scale by orders of magnitude and a single global step
+# size is set by the worst of them.
+#
+# tau = 1 stops the very first step, when s is near zero, from being enormous.
+fn advi_fit(logp: fn(Tensor) -> Tensor, init: Arr[F64], cfg: AdviConfig) -> AdviResult {
+  let r: random.Rng = random.new_rng(cfg.seed)
+  let d: I64 = len(init)
+
+  let mu: Arr[F64] = vec.copy(init)
+  # Starting at omega = 0 means a starting standard deviation of 1 on every
+  # coordinate. Starting smaller is tempting and is worse: a narrow initial q
+  # sees almost no variation in the log density, so the gradient with respect
+  # to omega is tiny and the width takes thousands of iterations to grow.
+  let omega: Arr[F64] = vec.zeros(d)
+
+  let s_mu: Arr[F64] = vec.zeros(d)
+  let s_om: Arr[F64] = vec.zeros(d)
+  let alpha: F64 = 0.1
+  let tau: F64 = 1.0
+
+  let history: Arr[F64] = []
+  let converged: Bool = false
+  let done_at: I64 = cfg.iterations
+
+  let n: I64 = 0
+  while n < cfg.iterations and not converged {
+    let g_mu: Arr[F64] = vec.zeros(d)
+    let g_om: Arr[F64] = vec.zeros(d)
+    let elbo_acc: F64 = 0.0
+
+    let s: I64 = 0
+    while s < cfg.mc_samples {
+      # The fixed noise. Drawn outside the differentiated function, which is
+      # the entire point: inside it, it would be a source of randomness the
+      # gradient cannot see through.
+      let eps_arr: Arr[F64] = []
+      let i: I64 = 0
+      while i < d {
+        push(eps_arr, random.normal(r))
+        i = i + 1
+      }
+      let eps: Tensor = vec.to_tensor(eps_arr)
+
+      # One Monte Carlo estimate of the ELBO, as a function of the variational
+      # parameters. `grads` differentiates it with respect to both.
+      let objective = fn(m: Tensor, w: Tensor) -> Tensor {
+        let theta: Tensor = m + exp(w) * eps
+        logp(theta) + entropy(w, d)
+      }
+
+      let mu_t: Tensor = vec.to_tensor(mu)
+      let om_t: Tensor = vec.to_tensor(omega)
+
+      elbo_acc = elbo_acc + vec.scalar_of(objective(mu_t, om_t))
+      let g = grads(objective)(mu_t, om_t)
+      g_mu = vec.add(g_mu, vec.of_tensor(g[0]))
+      g_om = vec.add(g_om, vec.of_tensor(g[1]))
+
+      s = s + 1
+    }
+
+    let inv_s: F64 = 1.0 / f64_of_i64(cfg.mc_samples)
+    g_mu = vec.scale(g_mu, inv_s)
+    g_om = vec.scale(g_om, inv_s)
+    push(history, elbo_acc * inv_s)
+
+    # A non-finite gradient means the draw landed outside the support. The step
+    # is skipped rather than taken, because taking it moves the variational
+    # parameters to a NaN and every subsequent iteration is lost. Skipping is
+    # not a fix and the ELBO history shows the gap.
+    if vec.all_finite(g_mu) and vec.all_finite(g_om) {
+      let decay: F64 = f64_pow(f64_of_i64(n + 1), -0.5)
+      let i: I64 = 0
+      while i < d {
+        s_mu[i] = alpha * g_mu[i] * g_mu[i] + (1.0 - alpha) * s_mu[i]
+        s_om[i] = alpha * g_om[i] * g_om[i] + (1.0 - alpha) * s_om[i]
+        # Ascent, because the ELBO is being maximised. A sign error here gives
+        # an optimiser that runs away from the posterior, which is visible in
+        # the ELBO history as a number falling without bound, and is the first
+        # thing to check.
+        mu[i] = mu[i] + cfg.eta * decay / (tau + f64_sqrt(s_mu[i])) * g_mu[i]
+        omega[i] = omega[i] + cfg.eta * decay / (tau + f64_sqrt(s_om[i])) * g_om[i]
+        i = i + 1
+      }
+    }
+
+    # Convergence on the relative change of the ELBO, averaged over a window.
+    # A single-iteration change is dominated by the Monte Carlo noise in the
+    # estimate and would declare convergence at the first lucky draw.
+    if len(history) >= 2 * cfg.window {
+      let recent: F64 = window_mean(history, len(history) - cfg.window, cfg.window)
+      let earlier: F64 = window_mean(history, len(history) - 2 * cfg.window, cfg.window)
+      let denom: F64 = earlier
+      if denom < 0.0 {
+        denom = 0.0 - denom
+      }
+      if denom > 0.0 {
+        let rel: F64 = (recent - earlier) / denom
+        if rel < 0.0 {
+          rel = 0.0 - rel
+        }
+        if rel < cfg.tol {
+          converged = true
+          done_at = n + 1
+        }
+      }
+    }
+
+    n = n + 1
+  }
+
+  AdviResult { mu: mu, omega: omega, elbo: history, iterations: done_at, converged: converged }
+}
+
+fn window_mean(xs: Arr[F64], start: I64, count: I64) -> F64 {
+  let s: F64 = 0.0
+  let i: I64 = 0
+  while i < count {
+    s = s + xs[start + i]
+    i = i + 1
+  }
+  s / f64_of_i64(count)
+}
+
+# ---- using the fit ----------------------------------------------------------
+
+# Draws from the fitted approximation, in the unconstrained space, in the same
+# shape a sampler returns so the summary machinery works on them.
+#
+# They are not posterior draws and `src/diag.tw`'s R-hat will report nothing
+# useful about them, because they are independent by construction: R-hat on
+# independent draws is 1.00 whatever the approximation's quality. That number
+# is not a check and must not be read as one.
+fn advi_draws(res: AdviResult, count: I64, seed: I64) -> Arr[Arr[F64]] {
+  let r: random.Rng = random.new_rng(seed)
+  let out: Arr[Arr[F64]] = []
+  let i: I64 = 0
+  while i < count {
+    let q: Arr[F64] = []
+    let j: I64 = 0
+    while j < len(res.mu) {
+      push(q, res.mu[j] + f64_exp(res.omega[j]) * random.normal(r))
+      j = j + 1
+    }
+    push(out, q)
+    i = i + 1
+  }
+  out
+}
+
+# The fitted mean, which is the natural place to start NUTS. This is the use of
+# ADVI that survives every criticism above: the approximation's centre is close
+# to the posterior's typical set, so NUTS spends its warmup adapting rather
+# than travelling.
+fn advi_init(res: AdviResult) -> Arr[F64] = vec.copy(res.mu)
+
+# The fitted standard deviations, which are the natural initial diagonal for
+# the mass matrix, for the same reason.
+fn advi_inv_mass(res: AdviResult) -> Arr[F64] {
+  let out: Arr[F64] = []
+  let i: I64 = 0
+  while i < len(res.omega) {
+    let sd: F64 = f64_exp(res.omega[i])
+    push(out, sd * sd)
+    i = i + 1
+  }
+  out
+}

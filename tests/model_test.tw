@@ -1,0 +1,249 @@
+mode systems
+
+import "harness.tw" as t
+import "../src/model.tw" as model
+import "../src/adapt.tw" as adapt
+import "../src/vec.tw" as vec
+import "../src/dist.tw" as dist
+
+# ---- the layout -------------------------------------------------------------
+
+fn a_layout_places_blocks_end_to_end() {
+  let l = model.new_layout()
+  t.equal_str("declaring an intercept succeeds", model.declare(l, "alpha", 1), "")
+  t.equal_str("declaring coefficients succeeds", model.declare(l, "beta", 3), "")
+  t.equal_str("declaring a scale succeeds", model.declare(l, "sigma", 1), "")
+
+  t.equal_i64("the total is the sum of the sizes", l.total, 5)
+  t.equal_i64("alpha starts at zero", l.offsets[0], 0)
+  t.equal_i64("beta starts after alpha", l.offsets[1], 1)
+  t.equal_i64("sigma starts after beta", l.offsets[2], 4)
+}
+
+# The refusals. A model with two blocks called "sigma" has a bug, and the
+# second one silently winning is the worst of the outcomes available.
+fn a_duplicate_block_name_is_refused() {
+  let l = model.new_layout()
+  model.declare(l, "sigma", 1)
+  let err: Str = model.declare(l, "sigma", 2)
+  t.check("the duplicate is refused", len(err) > 0)
+  t.equal_i64("and nothing was added", l.total, 1)
+}
+
+fn a_zero_sized_block_is_refused() {
+  let l = model.new_layout()
+  t.check("size zero is refused", len(model.declare(l, "empty", 0)) > 0)
+  t.check("a negative size is refused", len(model.declare(l, "bad", -3)) > 0)
+}
+
+fn a_block_reads_the_right_slice_of_the_vector() {
+  let l = model.new_layout()
+  model.declare(l, "a", 1)
+  model.declare(l, "b", 3)
+
+  let q: Tensor = [10.0, 20.0, 30.0, 40.0]
+  let b: Tensor = model.block(l, q, "b")
+  t.near("the block starts after a", item(b[0]), 20.0, 0.0)
+  t.near("and runs to the end", item(b[2]), 40.0, 0.0)
+}
+
+# The distinction that catches a shape bug which is right by accident whenever
+# the vector length happens to be one.
+fn a_scalar_block_is_rank_zero_and_a_size_one_block_is_not() {
+  let l = model.new_layout()
+  model.declare(l, "s", 1)
+  let q: Tensor = [7.0]
+  t.equal_i64("block gives a length-one vector", len(shape(model.block(l, q, "s"))), 1)
+  t.equal_i64("scalar_block gives a rank-zero tensor",
+    len(shape(model.scalar_block(l, q, "s"))), 0)
+}
+
+fn a_block_read_from_an_array_matches_the_tensor_form() {
+  let l = model.new_layout()
+  model.declare(l, "a", 2)
+  model.declare(l, "b", 2)
+  let q: Arr[F64] = [1.0, 2.0, 3.0, 4.0]
+  let b: Arr[F64] = model.block_arr(l, q, "b")
+  t.equal_i64("the block has the declared size", len(b), 2)
+  t.near("first element", b[0], 3.0, 0.0)
+  t.near("second element", b[1], 4.0, 0.0)
+}
+
+fn coordinate_names_index_from_one() {
+  let l = model.new_layout()
+  model.declare(l, "alpha", 1)
+  model.declare(l, "beta", 2)
+  let names: Arr[Str] = model.coordinate_names(l)
+  t.equal_i64("one name per coordinate", len(names), 3)
+  t.equal_str("a size-one block keeps its bare name", names[0], "alpha")
+  t.equal_str("a larger block is indexed from one", names[1], "beta[1]")
+  t.equal_str("and counts up", names[2], "beta[2]")
+}
+
+# ---- the gradient seam ------------------------------------------------------
+#
+# The claim the whole library rests on: a model written as an ordinary twill
+# function has its gradient supplied by the language, correctly, with no
+# backward pass anywhere in this repository.
+
+fn the_value_and_gradient_of_a_model_are_both_right() {
+  let l = model.new_layout()
+  model.declare(l, "mu", 1)
+  model.declare(l, "log_sigma", 1)
+
+  let data: Tensor = [1.0, 2.0, 3.0, 2.5]
+
+  let logp = fn(q: Tensor) -> Tensor {
+    let mu: Tensor = model.scalar_block(l, q, "mu")
+    let ls: Tensor = model.scalar_block(l, q, "log_sigma")
+    dist.normal_log_prob(data, mu, exp(ls))
+      + dist.normal_log_prob(mu, scalar(0.0), scalar(10.0))
+      + ls
+  }
+
+  let q: Arr[F64] = [2.0, 0.0]
+  let d = model.value_and_gradient(logp, q)
+
+  t.near("the value matches a direct evaluation", d.value, model.log_density(logp, q),
+    0.000000000001)
+  t.equal_i64("the gradient has one entry per coordinate", len(d.grad), 2)
+
+  # Central differences on both coordinates.
+  let h: F64 = 0.00001
+  let k: I64 = 0
+  while k < 2 {
+    let plus: Arr[F64] = vec.copy(q)
+    let minus: Arr[F64] = vec.copy(q)
+    plus[k] = plus[k] + h
+    minus[k] = minus[k] - h
+    t.near_grad("gradient coordinate " + str(k), d.grad[k],
+      model.log_density(logp, plus), model.log_density(logp, minus), h, 0.0000001)
+    k = k + 1
+  }
+}
+
+fn a_point_outside_the_support_is_reported_as_unusable() {
+  # A log of a negative number gives a NaN, which is what an out-of-support
+  # point produces in practice.
+  let logp = fn(q: Tensor) -> Tensor = log(q[0])
+  let d = model.value_and_gradient(logp, [-1.0])
+  t.check("a NaN density is not usable", not model.is_usable(d))
+
+  let ok = model.value_and_gradient(logp, [2.0])
+  t.check("an ordinary point is usable", model.is_usable(ok))
+}
+
+# ---- adaptation -------------------------------------------------------------
+
+fn dual_averaging_drives_the_step_toward_the_target() {
+  # A synthetic feedback loop: the acceptance falls as the step grows. The
+  # scheme should settle where the acceptance equals the target.
+  let da = adapt.dual_avg(1.0, 0.8)
+  let i: I64 = 0
+  while i < 2000 {
+    let eps: F64 = adapt.dual_avg_current(da)
+    # A monotone decreasing acceptance in eps, equal to 0.8 at eps = 0.25.
+    let a: F64 = f64_exp(0.0 - eps / 1.1200674)
+    adapt.dual_avg_update(da, a)
+    i = i + 1
+  }
+  t.near("the averaged step lands on the target", adapt.dual_avg_final(da), 0.25, 0.03)
+}
+
+# The averaged iterate is what gets frozen, and it must be steadier than the
+# current one. Freezing the current iterate is a real and common mistake and it
+# gives a step size that is whatever the last draw's noise made it.
+fn the_averaged_step_is_steadier_than_the_current_one() {
+  let da = adapt.dual_avg(1.0, 0.8)
+  let i: I64 = 0
+  while i < 500 {
+    # An acceptance that oscillates hard around the target.
+    let a: F64 = 0.8
+    if i % 2 == 0 {
+      a = 0.2
+    } else {
+      a = 1.0
+    }
+    adapt.dual_avg_update(da, a)
+    i = i + 1
+  }
+  let cur_a: F64 = adapt.dual_avg_current(da)
+  adapt.dual_avg_update(da, 0.2)
+  let cur_b: F64 = adapt.dual_avg_current(da)
+  let bar_a: F64 = adapt.dual_avg_final(da)
+
+  let moved_current: F64 = cur_b - cur_a
+  if moved_current < 0.0 {
+    moved_current = 0.0 - moved_current
+  }
+  let moved_bar: F64 = adapt.dual_avg_final(da) - bar_a
+  if moved_bar < 0.0 {
+    moved_bar = 0.0 - moved_bar
+  }
+  t.check("the averaged iterate moves less than the current one",
+    moved_bar < moved_current)
+}
+
+fn welford_computes_the_sample_variance() {
+  let w = adapt.welford(2)
+  adapt.welford_add(w, [1.0, 10.0])
+  adapt.welford_add(w, [2.0, 20.0])
+  adapt.welford_add(w, [3.0, 30.0])
+  adapt.welford_add(w, [4.0, 40.0])
+  let v: Arr[F64] = adapt.welford_variance(w)
+  # The sample variance of 1,2,3,4 is 5/3. The shrinkage toward 0.001 with
+  # n = 4 is n/(n+5) = 4/9 of the estimate.
+  let shrunk: F64 = 4.0 / 9.0 * (5.0 / 3.0) + 5.0 / 9.0 * 0.001
+  t.near("the first coordinate's regularised variance", v[0], shrunk, 0.000000001)
+  t.check("the second coordinate is a hundred times larger", v[1] > 50.0 * v[0])
+}
+
+fn welford_returns_the_identity_before_it_has_data() {
+  let w = adapt.welford(3)
+  let v: Arr[F64] = adapt.welford_variance(w)
+  t.near("an unfilled estimator is the identity", v[0], 1.0, 0.0)
+  adapt.welford_add(w, [1.0, 2.0, 3.0])
+  t.near("and still is after one draw", adapt.welford_variance(w)[0], 1.0, 0.0)
+}
+
+fn a_short_warmup_gives_up_on_the_metric_rather_than_estimating_it_badly() {
+  let s = adapt.schedule(100)
+  let i: I64 = 0
+  while i < 100 {
+    t.check("no window ends during a short warmup", not adapt.is_window_end(s, i))
+    i = i + 1
+  }
+}
+
+fn a_long_warmup_has_doubling_windows() {
+  let s = adapt.schedule(1000)
+  let ends: I64 = 0
+  let i: I64 = 0
+  while i < 1000 {
+    if adapt.is_window_end(s, i) {
+      ends = ends + 1
+      adapt.next_window(s)
+    }
+    i = i + 1
+  }
+  t.check("several windows closed", ends >= 3)
+  t.check("but not one per draw", ends < 20)
+}
+
+a_layout_places_blocks_end_to_end()
+a_duplicate_block_name_is_refused()
+a_zero_sized_block_is_refused()
+a_block_reads_the_right_slice_of_the_vector()
+a_scalar_block_is_rank_zero_and_a_size_one_block_is_not()
+a_block_read_from_an_array_matches_the_tensor_form()
+coordinate_names_index_from_one()
+the_value_and_gradient_of_a_model_are_both_right()
+a_point_outside_the_support_is_reported_as_unusable()
+dual_averaging_drives_the_step_toward_the_target()
+the_averaged_step_is_steadier_than_the_current_one()
+welford_computes_the_sample_variance()
+welford_returns_the_identity_before_it_has_data()
+a_short_warmup_gives_up_on_the_metric_rather_than_estimating_it_badly()
+a_long_warmup_has_doubling_windows()
+
+t.report("heddle model")

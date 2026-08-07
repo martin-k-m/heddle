@@ -1,0 +1,179 @@
+mode systems
+
+# Eight schools, the standard first hierarchical model, in both of its
+# parameterisations.
+#
+# Eight studies each estimated the effect of a coaching programme. Each
+# reported an effect and a standard error. The question is whether the
+# programme works, and the answer has to borrow strength across studies without
+# assuming they measured the same thing.
+#
+#   mu ~ Normal(0, 5)                    the average effect
+#   tau ~ HalfNormal(5)                  how much the schools differ
+#   theta_j ~ Normal(mu, tau)            each school's true effect
+#   y_j ~ Normal(theta_j, sigma_j)       what each school measured
+#
+# The model is run twice. The centred version samples theta directly and
+# produces divergences, because when tau is small the theta's are squeezed into
+# a narrow neck that the step size cannot resolve. The non-centred version
+# samples a standardised z and sets theta = mu + tau * z, which has no neck at
+# all.
+#
+# Both are here because the difference between them is the single most useful
+# thing to know about hierarchical models, and because it is the case where
+# heddle's divergence count is the only thing that tells you which one you are
+# running.
+
+import "../src/dist.tw" as dist
+import "../src/transform.tw" as tr
+import "../src/model.tw" as model
+import "../src/nuts.tw" as nuts
+import "../src/diag.tw" as diag
+import "../src/chain.tw" as chain
+import "../src/advi.tw" as advi
+import "../src/vec.tw" as vec
+
+import "std/random" as random
+
+let Y: Tensor = [28.0, 8.0, -3.0, 7.0, -1.0, 1.0, 18.0, 12.0]
+let SIGMA: Tensor = [15.0, 10.0, 16.0, 11.0, 9.0, 11.0, 10.0, 18.0]
+let J: I64 = 8
+
+# ---- the centred parameterisation ------------------------------------------
+#
+# Ten coordinates: mu, log tau, and eight theta's. tau is sampled on the log
+# scale, so the density carries `positive_log_jac`. Leaving that term out would
+# bias tau downward, which on this model means concluding the schools agree
+# more than they do.
+
+let CENTRED = model.new_layout()
+model.declare(CENTRED, "mu", 1)
+model.declare(CENTRED, "log_tau", 1)
+model.declare(CENTRED, "theta", J)
+
+fn centred(q: Tensor) -> Tensor {
+  let mu: Tensor = model.scalar_block(CENTRED, q, "mu")
+  let log_tau: Tensor = model.scalar_block(CENTRED, q, "log_tau")
+  let theta: Tensor = model.block(CENTRED, q, "theta")
+  let tau: Tensor = exp(log_tau)
+
+  dist.normal_log_prob(mu, scalar(0.0), scalar(5.0))
+    + dist.half_normal_log_prob(tau, scalar(5.0))
+    + tr.positive_log_jac(log_tau)
+    + dist.normal_log_prob(theta, mu, tau)
+    + dist.normal_log_prob(Y, theta, SIGMA)
+}
+
+# ---- the non-centred parameterisation ---------------------------------------
+#
+# The same posterior over mu and tau, written so the sampler never sees the
+# funnel. theta is not a parameter here; it is computed from z and reported
+# afterwards.
+#
+# Nothing about the model changed. The prior, the likelihood and the posterior
+# are identical. Only the coordinates the sampler moves in are different, and
+# that is enough to turn a run with divergences into one without.
+
+let NON_CENTRED = model.new_layout()
+model.declare(NON_CENTRED, "mu", 1)
+model.declare(NON_CENTRED, "log_tau", 1)
+model.declare(NON_CENTRED, "z", J)
+
+fn non_centred(q: Tensor) -> Tensor {
+  let mu: Tensor = model.scalar_block(NON_CENTRED, q, "mu")
+  let log_tau: Tensor = model.scalar_block(NON_CENTRED, q, "log_tau")
+  let z: Tensor = model.block(NON_CENTRED, q, "z")
+  let tau: Tensor = exp(log_tau)
+  let theta: Tensor = mu + tau * z
+
+  dist.normal_log_prob(mu, scalar(0.0), scalar(5.0))
+    + dist.half_normal_log_prob(tau, scalar(5.0))
+    + tr.positive_log_jac(log_tau)
+    + dist.normal_log_prob(z, scalar(0.0), scalar(1.0))
+    + dist.normal_log_prob(Y, theta, SIGMA)
+}
+
+# ---- reporting --------------------------------------------------------------
+
+fn report(title: Str, cs: Arr[chain.Chain], names: Arr[Str], max_depth: I64) {
+  print("")
+  print(title)
+  print("  parameter        mean      sd      5%     50%     95%    mcse     ess   rhat")
+
+  let s = diag.summarise(cs, names)
+  let i: I64 = 0
+  while i < len(s) {
+    print("  " + s[i].name
+      + "  " + str(s[i].mean)
+      + "  " + str(s[i].sd)
+      + "  " + str(s[i].q5)
+      + "  " + str(s[i].q50)
+      + "  " + str(s[i].q95)
+      + "  " + str(s[i].mcse)
+      + "  " + str(s[i].ess)
+      + "  " + str(s[i].rhat))
+    i = i + 1
+  }
+
+  print("  divergent: " + str(chain.total_divergences(cs))
+    + " of " + str(chain.total_draws(cs)))
+
+  let w: Arr[Str] = diag.warnings(cs, s, max_depth)
+  i = 0
+  while i < len(w) {
+    print("")
+    print("  " + w[i])
+    i = i + 1
+  }
+}
+
+fn dispersed_inits(dim: I64, n: I64, seed: I64) -> Arr[Arr[F64]] {
+  # Chains must start apart. R-hat compares within-chain against between-chain
+  # variance, so chains started at the same point agree early for reasons that
+  # have nothing to do with convergence, and R-hat is then optimistic exactly
+  # when it is most needed.
+  let r: random.Rng = random.new_rng(seed)
+  let out: Arr[Arr[F64]] = []
+  let c: I64 = 0
+  while c < n {
+    let q: Arr[F64] = []
+    let i: I64 = 0
+    while i < dim {
+      push(q, random.uniform_range(r, -2.0, 2.0))
+      i = i + 1
+    }
+    push(out, q)
+    c = c + 1
+  }
+  out
+}
+
+# ---- the run ----------------------------------------------------------------
+
+let cfg = nuts.nuts_config(1000, 2000, 20260807)
+
+let centred_chains = nuts.run_chains(centred,
+  dispersed_inits(CENTRED.total, 4, 1), cfg)
+report("centred parameterisation", centred_chains,
+  model.coordinate_names(CENTRED), cfg.max_depth)
+
+let nc_chains = nuts.run_chains(non_centred,
+  dispersed_inits(NON_CENTRED.total, 4, 2), cfg)
+report("non-centred parameterisation", nc_chains,
+  model.coordinate_names(NON_CENTRED), cfg.max_depth)
+
+# ---- and the fast approximation ---------------------------------------------
+#
+# ADVI on the same model, for the use that survives every criticism of it:
+# a starting point. The fitted mean is close to the typical set, so NUTS spends
+# its warmup adapting rather than travelling.
+
+let vi = advi.advi_fit(non_centred, vec.zeros(NON_CENTRED.total),
+  advi.advi_config(20000, 5))
+
+print("")
+print("mean field ADVI, " + str(vi.iterations) + " iterations, converged: " + str(vi.converged))
+print("  mu    " + str(vi.mu[0]) + " +- " + str(f64_exp(vi.omega[0])))
+print("  log tau " + str(vi.mu[1]) + " +- " + str(f64_exp(vi.omega[1])))
+print("  These are not posterior draws and no diagnostic here checks them.")
+print("  Mean field understates the width. Use them to start NUTS, not to report.")

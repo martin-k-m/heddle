@@ -1,0 +1,259 @@
+mode systems
+
+import "harness.tw" as t
+import "../src/nuts.tw" as nuts
+import "../src/rwm.tw" as rwm
+import "../src/chain.tw" as chain
+import "../src/diag.tw" as diag
+import "../src/dist.tw" as dist
+import "../src/transform.tw" as tr
+import "../src/vec.tw" as vec
+
+fn std_normal(q: Tensor) -> Tensor = dist.normal_log_prob(q, scalar(0.0), scalar(1.0))
+
+# A correlated Gaussian, to check that the metric adaptation is doing
+# something. Sigma has a correlation of 0.9 and the two marginals differ in
+# scale by a factor of ten, which is the situation an identity metric handles
+# badly.
+fn correlated(q: Tensor) -> Tensor {
+  let l: Tensor = [[1.0, 0.0], [9.0, 4.3588989435406740]]
+  dist.mvnormal_log_prob(q, [0.0, 0.0], l, 2)
+}
+
+# Neal's funnel, in its centred parameterisation. The classic pathological
+# posterior: v ~ Normal(0, 3) and x_i ~ Normal(0, exp(v/2)), so the width of x
+# varies by orders of magnitude with v and the neck of the funnel has curvature
+# no single step size can handle. This is the target that produces divergences,
+# and a sampler that reports none on it is not detecting them.
+fn funnel(q: Tensor) -> Tensor {
+  let v: Tensor = q[0]
+  let x: Tensor = q[1:6]
+  dist.normal_log_prob(v, scalar(0.0), scalar(3.0))
+    + dist.normal_log_prob(x, scalar(0.0), exp(0.5 * v))
+}
+
+# ---- the U-turn criterion ---------------------------------------------------
+#
+# Tested directly rather than only through the sampler, because a wrong
+# criterion produces a sampler that still works and is slower, and "slower" is
+# not something a moment test detects.
+
+fn a_momentum_pointing_forward_is_not_a_u_turn() {
+  let rho: Arr[F64] = [1.0, 0.0]
+  t.check("both ends agree with the direction of travel",
+    not nuts.is_u_turn([1.0, 0.0], [1.0, 0.0], rho))
+}
+
+fn a_momentum_pointing_back_at_either_end_is_a_u_turn() {
+  let rho: Arr[F64] = [1.0, 0.0]
+  t.check("the minus end has turned", nuts.is_u_turn([-1.0, 0.0], [1.0, 0.0], rho))
+  t.check("the plus end has turned", nuts.is_u_turn([1.0, 0.0], [-1.0, 0.0], rho))
+}
+
+# BOTH ends must be checked. A criterion that only looked at one would pass the
+# second half of the test above and would break detailed balance, because the
+# stopping rule would no longer be symmetric under reversing the trajectory.
+fn a_perpendicular_momentum_is_not_yet_a_turn() {
+  t.check("zero is not a turn", not nuts.is_u_turn([0.0, 1.0], [0.0, 1.0], [1.0, 0.0]))
+}
+
+# The metric must be applied before the dot product. With inv_mass = 1 the two
+# forms agree, which is why an implementation missing it passes every test on a
+# standard normal. Here the metric is what decides the answer.
+fn the_metric_decides_the_criterion_when_the_scales_differ() {
+  let p_minus: Arr[F64] = [1.0, -3.0]
+  let p_plus: Arr[F64] = [1.0, 1.0]
+  let rho: Arr[F64] = [0.5, 2.0]
+
+  let identity: Arr[F64] = [1.0, 1.0]
+  let stretched: Arr[F64] = [1.0, 100.0]
+
+  let a: Bool = nuts.is_u_turn(nuts.p_sharp(p_minus, identity),
+                               nuts.p_sharp(p_plus, identity), rho)
+  let b: Bool = nuts.is_u_turn(nuts.p_sharp(p_minus, stretched),
+                               nuts.p_sharp(p_plus, stretched), rho)
+  t.check("under an identity metric this is not a turn", not a)
+  t.check("under a stretched metric it is", b)
+}
+
+# ---- the numerically careful helper ----------------------------------------
+
+fn log_add_is_stable_across_a_large_gap() {
+  # exp(-800) + exp(-1) computed naively is 0 + exp(-1), and the log of that in
+  # the naive form underflows first. The stable form returns the larger plus a
+  # negligible correction.
+  t.near("log_add with a huge gap", nuts.log_add(-1.0, -800.0), -1.0, 0.000000000001)
+  t.near("log_add of two equals adds log 2", nuts.log_add(-5.0, -5.0),
+    -5.0 + 0.6931471805599453, 0.000000000001)
+}
+
+# ---- moments ----------------------------------------------------------------
+
+fn nuts_recovers_the_standard_normal() {
+  let cfg = nuts.nuts_config(500, 2000, 20260807)
+  let c = nuts.run_chain(std_normal, [0.0, 0.0], cfg)
+
+  let col: Arr[F64] = chain.column(c, 0)
+  t.near("the posterior mean is zero", diag.mean_of(col), 0.0, 0.06)
+  t.near("the posterior sd is one", diag.sd_of(col), 1.0, 0.05)
+  t.equal_i64("no transition diverged on a Gaussian", c.n_divergent, 0)
+  t.check("the step size settled somewhere sensible",
+    c.step_size > 0.1 and c.step_size < 3.0)
+}
+
+# The comparison that catches a NUTS bug which biases rather than breaks. A
+# tree with a wrong multinomial weight, a merge that takes the wrong end, or a
+# missing extra U-turn check all produce a chain that looks healthy and whose
+# mean is off by a fraction of a standard deviation. Random walk Metropolis is
+# slow and its correctness rests on three lines, so a disagreement between them
+# is a bug in the tree.
+fn nuts_and_random_walk_metropolis_agree_on_a_correlated_gaussian() {
+  let n_cfg = nuts.nuts_config(600, 3000, 11)
+  let nc = nuts.run_chain(correlated, [0.0, 0.0], n_cfg)
+
+  let r_cfg = rwm.rwm_config(3000, 40000, 12)
+  let rc = rwm.run_chain(correlated, [0.0, 0.0], r_cfg)
+
+  let k: I64 = 0
+  while k < 2 {
+    let a: Arr[F64] = chain.column(nc, k)
+    let b: Arr[F64] = chain.column(rc, k)
+    t.near("coordinate " + str(k) + " mean agrees", diag.mean_of(a), diag.mean_of(b), 0.25)
+    t.near("coordinate " + str(k) + " sd agrees", diag.sd_of(a), diag.sd_of(b), 0.6)
+    k = k + 1
+  }
+}
+
+# The point of NUTS. It should be beating the random walk by a wide margin in
+# effective draws per gradient evaluation, and if it is not, the trajectories
+# are being cut short, which is what a missing cross-boundary U-turn check
+# does.
+fn nuts_gets_far_more_effective_draws_per_gradient_than_a_random_walk() {
+  let n_cfg = nuts.nuts_config(600, 2000, 21)
+  let nc = nuts.run_chain(correlated, [0.0, 0.0], n_cfg)
+
+  let grads_used: I64 = 0
+  let i: I64 = 0
+  while i < len(nc.n_leapfrog) {
+    grads_used = grads_used + nc.n_leapfrog[i]
+    i = i + 1
+  }
+
+  let series: Arr[Arr[F64]] = [chain.column(nc, 0)]
+  let e: F64 = diag.ess(series)
+  t.check("NUTS produced a useful effective sample size", e > 400.0)
+  t.check("without an absurd number of gradient evaluations",
+    grads_used < 2000 * 200)
+}
+
+# ---- divergences ------------------------------------------------------------
+#
+# The funnel is the test for the diagnostic, not for the sampler. A sampler
+# that reports zero divergences here is not detecting them, and a user of that
+# sampler gets a confidently wrong posterior for the neck of the funnel.
+
+fn the_funnel_produces_divergences_and_they_are_reported() {
+  let cfg = nuts.nuts_config(500, 1500, 777)
+  let c = nuts.run_chain(funnel, [0.0, 0.0, 0.0, 0.0, 0.0, 0.0], cfg)
+  t.check("the centred funnel diverges", c.n_divergent > 0)
+
+  let cs: Arr[chain.Chain] = [c]
+  let names: Arr[Str] = []
+  let w: Arr[Str] = diag.warnings(cs, diag.summarise(cs, names), cfg.max_depth)
+  t.check("and the warning says so", len(w) > 0)
+}
+
+# The non-centred parameterisation of the same model. x = exp(v/2) * z with
+# z ~ Normal(0,1) has no funnel geometry, because the width of z does not
+# depend on v. This is the fix for divergences that raising target_accept only
+# postpones, and it is here so the test suite states it rather than the README
+# alone.
+fn the_non_centred_funnel_does_not_diverge() {
+  let non_centred = fn(q: Tensor) -> Tensor {
+    let v: Tensor = q[0]
+    let z: Tensor = q[1:6]
+    dist.normal_log_prob(v, scalar(0.0), scalar(3.0))
+      + dist.normal_log_prob(z, scalar(0.0), scalar(1.0))
+  }
+  let cfg = nuts.nuts_config(500, 1500, 777)
+  let c = nuts.run_chain(non_centred, [0.0, 0.0, 0.0, 0.0, 0.0, 0.0], cfg)
+  t.equal_i64("reparameterising removes the divergences", c.n_divergent, 0)
+}
+
+# ---- transforms end to end --------------------------------------------------
+#
+# A model with a constrained parameter, sampled unconstrained, with the
+# Jacobian. The posterior for sigma under a half-normal prior and no data has a
+# known mean, and dropping the Jacobian would shift it down noticeably. This is
+# the test that would catch a transform whose Jacobian was omitted at the model
+# level rather than inside `src/transform.tw`.
+fn a_positive_parameter_with_its_jacobian_recovers_the_prior() {
+  # sigma ~ HalfNormal(1). Sampled as x with sigma = exp(x), so the density is
+  # half_normal(exp(x)) + x. The mean of a half normal with scale 1 is
+  # sqrt(2/pi) = 0.7978845608.
+  let model = fn(q: Tensor) -> Tensor {
+    let x: Tensor = q[0]
+    dist.half_normal_log_prob(exp(x), scalar(1.0)) + tr.positive_log_jac(x)
+  }
+  let cfg = nuts.nuts_config(500, 4000, 31337)
+  let c = nuts.run_chain(model, [0.0], cfg)
+
+  let s: F64 = 0.0
+  let i: I64 = 0
+  while i < len(c.draws) {
+    s = s + f64_exp(c.draws[i][0])
+    i = i + 1
+  }
+  t.near("the half normal prior mean is recovered",
+    s / f64_of_i64(len(c.draws)), 0.7978845608028654, 0.03)
+}
+
+# And the negative control: the same model without the Jacobian gives a
+# different and smaller answer. The test asserts the bias exists, because a
+# reader who is told the Jacobian matters deserves to see by how much.
+fn dropping_the_jacobian_biases_the_posterior_downward() {
+  let wrong = fn(q: Tensor) -> Tensor =
+    dist.half_normal_log_prob(exp(q[0]), scalar(1.0))
+  let cfg = nuts.nuts_config(500, 4000, 31337)
+  let c = nuts.run_chain(wrong, [0.0], cfg)
+
+  let s: F64 = 0.0
+  let i: I64 = 0
+  while i < len(c.draws) {
+    s = s + f64_exp(c.draws[i][0])
+    i = i + 1
+  }
+  t.check("the biased posterior mean is visibly too small",
+    s / f64_of_i64(len(c.draws)) < 0.7)
+}
+
+# ---- several chains ---------------------------------------------------------
+
+fn several_chains_get_independent_streams() {
+  let cfg = nuts.nuts_config(300, 500, 5150)
+  let inits: Arr[Arr[F64]] = [[2.0, 2.0], [-2.0, 2.0], [2.0, -2.0], [-2.0, -2.0]]
+  let cs = nuts.run_chains(std_normal, inits, cfg)
+
+  t.equal_i64("one chain per starting point", len(cs), 4)
+  t.check("the seeds differ", cs[0].seed != cs[1].seed)
+  t.check("and so do the draws", cs[0].draws[0][0] != cs[1].draws[0][0])
+
+  let series: Arr[Arr[F64]] = chain.columns(cs, 0)
+  t.check("dispersed chains still converge", diag.rhat(series) < 1.01)
+}
+
+a_momentum_pointing_forward_is_not_a_u_turn()
+a_momentum_pointing_back_at_either_end_is_a_u_turn()
+a_perpendicular_momentum_is_not_yet_a_turn()
+the_metric_decides_the_criterion_when_the_scales_differ()
+log_add_is_stable_across_a_large_gap()
+nuts_recovers_the_standard_normal()
+nuts_and_random_walk_metropolis_agree_on_a_correlated_gaussian()
+nuts_gets_far_more_effective_draws_per_gradient_than_a_random_walk()
+the_funnel_produces_divergences_and_they_are_reported()
+the_non_centred_funnel_does_not_diverge()
+a_positive_parameter_with_its_jacobian_recovers_the_prior()
+dropping_the_jacobian_biases_the_posterior_downward()
+several_chains_get_independent_streams()
+
+t.report("heddle nuts")

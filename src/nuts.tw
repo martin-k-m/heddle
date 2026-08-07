@@ -1,0 +1,633 @@
+mode systems
+
+# nuts.tw: the no-U-turn sampler.
+#
+# NUTS answers the one question static HMC leaves open: how long should the
+# trajectory be. It builds the trajectory by repeated doubling and stops when
+# the trajectory starts to double back on itself, which is the point past which
+# further integration returns toward where it began and buys nothing.
+#
+# Doing that while keeping the sampler correct is the whole difficulty, and it
+# is where implementations go subtly wrong. Two properties have to survive:
+#
+#   Reversibility. The trajectory must be built in a way that does not depend
+#   on which of its states you started from. This is why doubling picks a
+#   direction at random and extends from an end, rather than growing outward
+#   from the initial point in a fixed pattern: growing outward symmetrically
+#   would make the initial point special, and the initial point is the thing
+#   being resampled.
+#
+#   A stopping rule that does not leak information. The decision to stop must
+#   not depend on the state that will be selected, or the selection is biased.
+#   This is why a sub-trajectory that U-turns internally invalidates the whole
+#   doubling rather than contributing the part of itself that was fine.
+#
+# WHAT THIS IMPLEMENTATION IS
+#
+# Multinomial NUTS with a generalised U-turn criterion, which is the current
+# form rather than the 2011 paper's. Two differences from the original, both
+# of which matter:
+#
+#   The original used slice sampling to choose the state: draw u uniformly
+#   below exp(H0), keep the states whose energy is above it, pick one
+#   uniformly. Multinomial sampling instead weights every state in the
+#   trajectory by exp(-H) and draws from that. It uses the whole trajectory
+#   rather than a slice of it, and the effective sample size per gradient
+#   evaluation is measurably better. Slice sampling also has a failure mode
+#   where a trajectory with one very high-energy state has almost no admissible
+#   points and the sampler stalls.
+#
+#   The original criterion used the position difference across the ends. The
+#   generalised criterion uses the summed momentum over the sub-trajectory.
+#   They agree for a Euclidean metric on a well-behaved posterior and the
+#   summed-momentum form is right in the cases where they differ, because it is
+#   the form derived from the metric rather than from the coordinates.
+
+import "std/random" as random
+import "src/vec.tw" as vec
+import "src/hmc.tw" as hmc
+import "src/model.tw" as model
+import "src/adapt.tw" as adapt
+import "src/chain.tw" as chain
+
+# ---- the U-turn criterion ---------------------------------------------------
+#
+# THE TERMINATION CONDITION, WHICH IS THE PART PEOPLE GET WRONG
+#
+# A sub-trajectory has turned back on itself when the momentum at one of its
+# ends is pointing back toward the other end. Written with the metric:
+#
+#   p_sharp_minus . rho < 0    or    p_sharp_plus . rho < 0
+#
+# where
+#
+#   rho        the sum of the momenta of every state in the sub-trajectory
+#   p_sharp    M^-1 p, the momentum raised into the position space by the
+#              inverse metric. For a diagonal metric that is elementwise
+#              inv_mass * p.
+#
+# Three things about this are easy to get wrong and each produces a sampler
+# that works well enough to ship.
+#
+# 1. THE METRIC MUST BE APPLIED. Using p . rho instead of (M^-1 p) . rho is
+#    dimensionally wrong: rho lives in momentum space and the dot product needs
+#    one of the two arguments raised. With an identity mass matrix the two are
+#    identical, so a test on a standard normal passes, and the error only shows
+#    up once mass adaptation starts doing something, as trajectories that stop
+#    too early in the wide directions.
+#
+# 2. rho IS THE SUM OVER THE SUB-TRAJECTORY, NOT THE DIFFERENCE OF THE ENDS.
+#    The sum of the momenta is a discrete approximation to the integral of p
+#    along the path, which is what q_plus - q_minus approximates under a
+#    Euclidean metric. Under a non-identity metric they are different objects
+#    and the sum is the correct one. Every merge below therefore carries rho up
+#    the tree.
+#
+# 3. BOTH ENDS MUST BE CHECKED. Checking only one end gives a criterion that is
+#    not symmetric under reversing the trajectory, and an asymmetric stopping
+#    rule breaks detailed balance. The `or` is not defensive; dropping either
+#    half makes the sampler target the wrong distribution.
+#
+# The sign convention: a negative dot product means the end momentum points
+# back along the trajectory, so the trajectory is turning. Zero is not a turn.
+
+fn p_sharp(p: Arr[F64], inv_mass: Arr[F64]) -> Arr[F64] = vec.mul(p, inv_mass)
+
+fn is_u_turn(sharp_minus: Arr[F64], sharp_plus: Arr[F64], rho: Arr[F64]) -> Bool {
+  if vec.dot(sharp_minus, rho) < 0.0 {
+    return true
+  }
+  vec.dot(sharp_plus, rho) < 0.0
+}
+
+# ---- a sub-tree -------------------------------------------------------------
+#
+# What a recursive build returns. Everything here is needed by the merge one
+# level up, and nothing here is needed by anything else.
+#
+#   minus / plus   the two ends of the sub-trajectory, in trajectory order,
+#                  which is not the order they were built in when the direction
+#                  is backward
+#   q_prop         the state selected from this sub-tree by multinomial
+#                  sampling, and its log density
+#   log_weight     logsumexp over the sub-tree of (-H), the total weight this
+#                  sub-tree carries into the merge
+#   rho            the summed momentum, for the U-turn criterion
+#   ok             false when this sub-tree contains a divergence or an
+#                  internal U-turn. A false here invalidates the entire
+#                  doubling, not just this sub-tree
+#   accept_sum,
+#   n_leapfrog     the acceptance statistic accumulated over every state, for
+#                  dual averaging
+
+struct Subtree {
+  q_minus: Arr[F64],
+  p_minus: Arr[F64],
+  grad_minus: Arr[F64],
+  q_plus: Arr[F64],
+  p_plus: Arr[F64],
+  grad_plus: Arr[F64],
+  q_prop: Arr[F64],
+  logp_prop: F64,
+  log_weight: F64,
+  rho: Arr[F64],
+  ok: Bool,
+  divergent: Bool,
+  accept_sum: F64,
+  n_leapfrog: I64,
+}
+
+# log(exp(a) + exp(b)), stable. The weights are negative energies and can be a
+# few hundred apart, so the naive form is 0 or +inf about as often as it is
+# right.
+fn log_add(a: F64, b: F64) -> F64 {
+  if not vec.is_finite(a) {
+    return b
+  }
+  if not vec.is_finite(b) {
+    return a
+  }
+  if a > b {
+    return a + f64_log(1.0 + f64_exp(b - a))
+  }
+  b + f64_log(1.0 + f64_exp(a - b))
+}
+
+# ---- building the tree ------------------------------------------------------
+#
+# `depth` counts down. At depth 0 the tree is a single leapfrog step; above it
+# the tree is two sub-trees of depth-1, built in sequence in the same
+# direction, and merged.
+#
+# `direction` is +1 or -1 and multiplies the step size, so a backward tree
+# integrates with a negative step. The leapfrog is reversible, so a negative
+# step is the exact inverse of a positive one, and this is why building
+# backward is legitimate rather than an approximation.
+#
+# The recursion is depth-first and left-to-right in the direction of travel, so
+# the sub-tree built first is the one nearer the starting end. The merge below
+# has to know that, and it does: `first` is nearer, `second` is further.
+
+fn build_tree(logp: fn(Tensor) -> Tensor, r: random.Rng, start: hmc.Point,
+              direction: F64, depth: I64, eps: F64, h0: F64,
+              inv_mass: Arr[F64], max_depth: I64) -> Subtree {
+
+  if depth == 0 {
+    return build_leaf(logp, start, direction, eps, h0, inv_mass)
+  }
+
+  let first: Subtree = build_tree(logp, r, start, direction, depth - 1, eps, h0,
+                                  inv_mass, max_depth)
+
+  # An invalid sub-tree stops the build immediately. Continuing to build the
+  # second half and then discarding it would be correct and would waste half
+  # the gradient evaluations of the deepest doubling, which is most of the cost
+  # of a divergent draw.
+  if not first.ok {
+    return first
+  }
+
+  # The second half starts from the far end of the first half, in the same
+  # direction.
+  let edge: hmc.Point = hmc.Point {
+    q: first.q_plus, p: first.p_plus, grad: first.grad_plus, logp: 0.0,
+  }
+  if direction < 0.0 {
+    edge = hmc.Point { q: first.q_minus, p: first.p_minus, grad: first.grad_minus, logp: 0.0 }
+  }
+
+  let second: Subtree = build_tree(logp, r, edge, direction, depth - 1, eps, h0,
+                                   inv_mass, max_depth)
+
+  merge(r, first, second, direction, inv_mass, false)
+}
+
+# The base case: one leapfrog step, one state.
+fn build_leaf(logp: fn(Tensor) -> Tensor, start: hmc.Point, direction: F64,
+              eps: F64, h0: F64, inv_mass: Arr[F64]) -> Subtree {
+  let pt: hmc.Point = hmc.leapfrog(logp, start, direction * eps, inv_mass)
+  let h: F64 = hmc.neg_energy(pt, inv_mass)
+
+  let divergent: Bool = hmc.is_divergent(h0, h)
+
+  # The acceptance statistic for this state, min(1, exp(h - h0)). Accumulated
+  # over every state in the trajectory and divided by the count at the top, so
+  # dual averaging sees the average over the whole tree. A divergent state
+  # contributes zero rather than being skipped: skipping it would let a draw
+  # that mostly diverged report a high acceptance and keep the step size that
+  # caused it.
+  let a: F64 = 1.0
+  if h - h0 < 0.0 {
+    a = f64_exp(h - h0)
+  }
+  if not vec.is_finite(h) {
+    a = 0.0
+  }
+
+  let weight: F64 = h
+  if divergent {
+    # A divergent state carries no weight into the multinomial draw. It is
+    # still returned, because the doubling that produced it must be rejected
+    # and the caller has to know.
+    weight = 0.0 - 1.0e308
+  }
+
+  Subtree {
+    q_minus: pt.q, p_minus: pt.p, grad_minus: pt.grad,
+    q_plus: pt.q, p_plus: pt.p, grad_plus: pt.grad,
+    q_prop: pt.q, logp_prop: pt.logp,
+    log_weight: weight,
+    rho: vec.copy(pt.p),
+    ok: not divergent,
+    divergent: divergent,
+    accept_sum: a,
+    n_leapfrog: 1,
+  }
+}
+
+# ---- merging two sub-trees --------------------------------------------------
+#
+# `first` is the half nearer the start of the doubling and `second` is the half
+# further along, both in the direction of travel. `direction` says which
+# geometric end each of those is, and getting that mapping wrong is a bug that
+# does not show up on a symmetric posterior.
+#
+# `top_level` selects between the two multinomial rules:
+#
+#   Inside the tree, the two halves are exchangeable and the state is drawn
+#   from the union with probability proportional to weight:
+#   P(take second) = w2 / (w1 + w2).
+#
+#   At the top level, where `first` is the existing trajectory and `second` is
+#   the freshly added doubling, the rule is biased: P(take new) = min(1, w2/w1).
+#   The bias is deliberate and it is a real improvement, not a hack. It pushes
+#   the selected state toward the newly explored end of the trajectory, which
+#   is the end furthest from where the chain already was, and it remains a
+#   valid sampler because the doubling is symmetric in direction. Using the
+#   unbiased rule at the top level costs a noticeable amount of effective
+#   sample size.
+
+fn merge(r: random.Rng, first: Subtree, second: Subtree, direction: F64,
+         inv_mass: Arr[F64], top_level: Bool) -> Subtree {
+
+  let out: Subtree = Subtree {
+    q_minus: first.q_minus, p_minus: first.p_minus, grad_minus: first.grad_minus,
+    q_plus: first.q_plus, p_plus: first.p_plus, grad_plus: first.grad_plus,
+    q_prop: first.q_prop, logp_prop: first.logp_prop,
+    log_weight: log_add(first.log_weight, second.log_weight),
+    rho: vec.add(first.rho, second.rho),
+    ok: first.ok and second.ok,
+    divergent: first.divergent or second.divergent,
+    accept_sum: first.accept_sum + second.accept_sum,
+    n_leapfrog: first.n_leapfrog + second.n_leapfrog,
+  }
+
+  # The geometric ends. Forward: `first` holds the minus end and `second` holds
+  # the plus end. Backward: the reverse, because a backward build walks the
+  # trajectory from its plus end toward its minus end.
+  if direction > 0.0 {
+    out.q_minus = first.q_minus
+    out.p_minus = first.p_minus
+    out.grad_minus = first.grad_minus
+    out.q_plus = second.q_plus
+    out.p_plus = second.p_plus
+    out.grad_plus = second.grad_plus
+  } else {
+    out.q_minus = second.q_minus
+    out.p_minus = second.p_minus
+    out.grad_minus = second.grad_minus
+    out.q_plus = first.q_plus
+    out.p_plus = first.p_plus
+    out.grad_plus = first.grad_plus
+  }
+
+  # The multinomial draw. Only from a valid second half: a sub-tree that
+  # diverged or turned contributes no candidate, because the states past the
+  # failure are not part of a valid trajectory.
+  if second.ok {
+    let take: F64 = 0.0
+    if top_level {
+      # min(1, exp(w2 - w1)), the biased progressive rule.
+      take = 1.0
+      if second.log_weight < first.log_weight {
+        take = f64_exp(second.log_weight - first.log_weight)
+      }
+    } else {
+      take = f64_exp(second.log_weight - out.log_weight)
+    }
+    if random.uniform(r) < take {
+      out.q_prop = second.q_prop
+      out.logp_prop = second.logp_prop
+    }
+  }
+
+  # ---- the U-turn checks -------------------------------------------------
+  #
+  # The main check, across the merged sub-trajectory's own ends.
+  if out.ok {
+    let sharp_minus: Arr[F64] = p_sharp(out.p_minus, inv_mass)
+    let sharp_plus: Arr[F64] = p_sharp(out.p_plus, inv_mass)
+    if is_u_turn(sharp_minus, sharp_plus, out.rho) {
+      out.ok = false
+    }
+  }
+
+  # THE TWO EXTRA CHECKS, AND WHY THEY ARE NOT OPTIONAL
+  #
+  # The main check looks at the merged sub-trajectory as a whole. It misses a
+  # U-turn that happens across the boundary between the two halves, because
+  # neither half's own check saw it (each half is fine internally) and the
+  # whole's check averages it away (the summed momentum over the whole can
+  # still point forward while the middle has already turned).
+  #
+  # The fix is to check two overlapping sub-trajectories that straddle the
+  # boundary: the first half extended by the second half's first state, and
+  # the second half extended by the first half's last state. Those are the two
+  # smallest windows that contain the boundary and are not already covered.
+  #
+  # Leaving these out gives a sampler that is right on a standard normal and
+  # runs long trajectories on anything with curvature, burning gradient
+  # evaluations to travel out and back. It is a performance bug that reads as
+  # a correctness one, because the wasted work shows up as a low effective
+  # sample size that gets blamed on the model.
+  if out.ok {
+    let rho_a: Arr[F64] = vec.add(first.rho, second.p_minus)
+    let sa_minus: Arr[F64] = p_sharp(first.p_minus, inv_mass)
+    let sa_plus: Arr[F64] = p_sharp(second.p_minus, inv_mass)
+    if direction < 0.0 {
+      rho_a = vec.add(first.rho, second.p_plus)
+      sa_minus = p_sharp(second.p_plus, inv_mass)
+      sa_plus = p_sharp(first.p_plus, inv_mass)
+    }
+    if is_u_turn(sa_minus, sa_plus, rho_a) {
+      out.ok = false
+    }
+  }
+
+  if out.ok {
+    let rho_b: Arr[F64] = vec.add(first.p_plus, second.rho)
+    let sb_minus: Arr[F64] = p_sharp(first.p_plus, inv_mass)
+    let sb_plus: Arr[F64] = p_sharp(second.p_plus, inv_mass)
+    if direction < 0.0 {
+      rho_b = vec.add(first.p_minus, second.rho)
+      sb_minus = p_sharp(second.p_minus, inv_mass)
+      sb_plus = p_sharp(first.p_minus, inv_mass)
+    }
+    if is_u_turn(sb_minus, sb_plus, rho_b) {
+      out.ok = false
+    }
+  }
+
+  out
+}
+
+# ---- one draw ---------------------------------------------------------------
+#
+# Draw a momentum, then double until the trajectory turns, diverges, or hits
+# the depth cap.
+#
+# THE DEPTH CAP IS A DIAGNOSTIC, NOT A TUNING PARAMETER
+#
+# Depth 10 means up to 1023 leapfrog steps in one draw. Hitting the cap means
+# the trajectory had not turned after a thousand steps, which almost always
+# means the posterior has a direction so much wider than the step size that
+# the sampler cannot cross it. Raising the cap makes each draw slower without
+# fixing that. Reparameterising the model does fix it. `src/diag.tw` reports
+# the number of draws that saturated the cap for exactly this reason, and a
+# nonzero count is a message about the model rather than about the sampler.
+
+fn nuts_draw(logp: fn(Tensor) -> Tensor, r: random.Rng, q: Arr[F64], eps: F64,
+             inv_mass: Arr[F64], max_depth: I64) -> hmc.DrawResult {
+
+  let p0: Arr[F64] = hmc.draw_momentum(r, inv_mass)
+  let start: hmc.Point = hmc.point_at(logp, vec.copy(q), p0)
+  let h0: F64 = hmc.neg_energy(start, inv_mass)
+
+  # The whole trajectory so far, as a Subtree holding one state: the starting
+  # point. Its weight is its own negative energy, so the multinomial draw
+  # includes the starting point, which is what makes staying put a possible
+  # outcome rather than a rejection.
+  let tree: Subtree = Subtree {
+    q_minus: start.q, p_minus: start.p, grad_minus: start.grad,
+    q_plus: start.q, p_plus: start.p, grad_plus: start.grad,
+    q_prop: vec.copy(start.q), logp_prop: start.logp,
+    log_weight: h0,
+    rho: vec.copy(start.p),
+    ok: true,
+    divergent: false,
+    accept_sum: 0.0,
+    n_leapfrog: 0,
+  }
+
+  let depth: I64 = 0
+  let divergent: Bool = false
+  let running: Bool = true
+
+  while running and depth < max_depth {
+    # A fair coin per doubling. This is what keeps the construction reversible:
+    # the probability of building a given trajectory from any of its states is
+    # the same, so the selected state can be treated as a draw from the
+    # trajectory's weights without a further correction.
+    let direction: F64 = 1.0
+    if random.bernoulli(r, 0.5) {
+      direction = -1.0
+    }
+
+    let edge: hmc.Point = hmc.Point {
+      q: tree.q_plus, p: tree.p_plus, grad: tree.grad_plus, logp: 0.0,
+    }
+    if direction < 0.0 {
+      edge = hmc.Point { q: tree.q_minus, p: tree.p_minus, grad: tree.grad_minus, logp: 0.0 }
+    }
+
+    let added: Subtree = build_tree(logp, r, edge, direction, depth, eps, h0,
+                                    inv_mass, max_depth)
+
+    if added.divergent {
+      divergent = true
+    }
+
+    if not added.ok {
+      # The new half is invalid. Its states are discarded entirely and the
+      # trajectory stops here.
+      #
+      # This is the property named at the top of the file. It is tempting to
+      # keep the valid prefix of the failed half, and it is wrong: whether a
+      # state was reached before or after the failure depends on the direction
+      # the doubling happened to take, so keeping the prefix makes the
+      # selection depend on the random direction and the sampler no longer
+      # targets the posterior. The statistic is still accumulated from those
+      # states, because dual averaging is not a sampling decision.
+      tree.accept_sum = tree.accept_sum + added.accept_sum
+      tree.n_leapfrog = tree.n_leapfrog + added.n_leapfrog
+      running = false
+    } else {
+      tree = merge(r, tree, added, direction, inv_mass, true)
+      depth = depth + 1
+      if not tree.ok {
+        # The merged trajectory has turned. The doubling itself was valid, so
+        # its state stands as the draw; only further doubling stops.
+        running = false
+      }
+    }
+  }
+
+  let stat: F64 = 0.0
+  if tree.n_leapfrog > 0 {
+    stat = tree.accept_sum / f64_of_i64(tree.n_leapfrog)
+  }
+
+  hmc.DrawResult {
+    q: tree.q_prop,
+    logp: tree.logp_prop,
+    accepted: true,
+    divergent: divergent,
+    accept_stat: stat,
+    steps: tree.n_leapfrog,
+    depth: depth,
+    energy: h0,
+  }
+}
+
+# ---- the run ----------------------------------------------------------------
+
+struct NutsConfig {
+  warmup: I64,
+  draws: I64,
+  max_depth: I64,
+  target_accept: F64,
+  seed: I64,
+  adapt_mass: Bool,
+}
+
+fn nuts_config(warmup: I64, draws: I64, seed: I64) -> NutsConfig =
+  NutsConfig {
+    warmup: warmup,
+    draws: draws,
+    max_depth: 10,
+    target_accept: 0.8,
+    seed: seed,
+    adapt_mass: true,
+  }
+
+fn run_chain(logp: fn(Tensor) -> Tensor, q_init: Arr[F64], cfg: NutsConfig) -> chain.Chain {
+  let r: random.Rng = random.new_rng(cfg.seed)
+  let dim: I64 = len(q_init)
+  let q: Arr[F64] = vec.copy(q_init)
+
+  let inv_mass: Arr[F64] = vec.ones(dim)
+
+  # The initial step size. The search takes one leapfrog step at a candidate
+  # and reads the resulting energy error, which is why it needs a closure over
+  # the density and the current point rather than a number.
+  let probe: hmc.Point = hmc.point_at(logp, vec.copy(q), hmc.draw_momentum(r, inv_mass))
+  let h_probe: F64 = hmc.neg_energy(probe, inv_mass)
+  let eps: F64 = adapt.initial_step_search(fn(e: F64) -> F64 {
+    let stepped: hmc.Point = hmc.leapfrog(logp, probe, e, inv_mass)
+    let h: F64 = hmc.neg_energy(stepped, inv_mass)
+    if not vec.is_finite(h) {
+      return -1.0e10
+    }
+    f64_min(0.0, h - h_probe)
+  })
+
+  let da = adapt.dual_avg(eps, cfg.target_accept)
+  let sched = adapt.schedule(cfg.warmup)
+  let w = adapt.welford(dim)
+
+  let ds: Arr[Arr[F64]] = []
+  let lp: Arr[F64] = []
+  let acc: Arr[F64] = []
+  let dep: Arr[I64] = []
+  let nlf: Arr[I64] = []
+  let div: Arr[Bool] = []
+  let en: Arr[F64] = []
+  let n_div: I64 = 0
+  let n_max: I64 = 0
+
+  # ---- warmup. Nothing here is a draw from the posterior.
+  let i: I64 = 0
+  while i < cfg.warmup {
+    let res = nuts_draw(logp, r, q, adapt.dual_avg_current(da), inv_mass, cfg.max_depth)
+    q = res.q
+    adapt.dual_avg_update(da, res.accept_stat)
+
+    if cfg.adapt_mass and adapt.in_window(sched, i) {
+      adapt.welford_add(w, q)
+    }
+
+    if cfg.adapt_mass and adapt.is_window_end(sched, i) {
+      inv_mass = adapt.welford_variance(w)
+      adapt.welford_reset(w, dim)
+      adapt.next_window(sched)
+      # The step size scheme restarts around the current best estimate. A
+      # changed metric changes the meaning of a step, so the accumulated error
+      # history describes a sampler that no longer exists.
+      adapt.dual_avg_restart(da, adapt.dual_avg_final(da))
+    }
+
+    i = i + 1
+  }
+
+  # The step size is frozen at the averaged iterate, not the current one. The
+  # current iterate is still jittering by construction.
+  let final_eps: F64 = adapt.dual_avg_final(da)
+  if cfg.warmup == 0 {
+    final_eps = eps
+  }
+
+  # ---- sampling. Adaptation is off, so the kernel is now invariant.
+  i = 0
+  while i < cfg.draws {
+    let res = nuts_draw(logp, r, q, final_eps, inv_mass, cfg.max_depth)
+    q = res.q
+    push(ds, vec.copy(q))
+    push(lp, res.logp)
+    push(acc, res.accept_stat)
+    push(dep, res.depth)
+    push(nlf, res.steps)
+    push(div, res.divergent)
+    push(en, res.energy)
+    if res.divergent {
+      n_div = n_div + 1
+    }
+    if res.depth >= cfg.max_depth {
+      n_max = n_max + 1
+    }
+    i = i + 1
+  }
+
+  chain.Chain {
+    draws: ds, logp: lp, accept_stat: acc, depth: dep, n_leapfrog: nlf,
+    divergent: div, energy: en, step_size: final_eps, inv_mass: inv_mass,
+    n_divergent: n_div, n_max_depth: n_max, seed: cfg.seed,
+  }
+}
+
+# Several chains from one config, each with its own derived seed.
+#
+# Derived rather than the same seed with a different starting point, and
+# derived rather than seeds chosen by hand. R-hat compares chains and is only
+# meaningful if they are independent; two chains sharing a stream are not, and
+# hand-picked seeds like 1, 2, 3 are independent here only because
+# `std/random.tw` runs them through splitmix first.
+#
+# The starting points are the caller's, and they should be dispersed. R-hat
+# compares within-chain and between-chain variance, so chains started at the
+# same point agree early for reasons that have nothing to do with convergence,
+# and R-hat is optimistic exactly when it is most needed.
+fn run_chains(logp: fn(Tensor) -> Tensor, inits: Arr[Arr[F64]], cfg: NutsConfig) -> Arr[chain.Chain] {
+  let out: Arr[chain.Chain] = []
+  let parent: random.Rng = random.new_rng(cfg.seed)
+  let i: I64 = 0
+  while i < len(inits) {
+    let child: NutsConfig = NutsConfig {
+      warmup: cfg.warmup, draws: cfg.draws, max_depth: cfg.max_depth,
+      target_accept: cfg.target_accept, seed: random.next_bits(parent),
+      adapt_mass: cfg.adapt_mass,
+    }
+    push(out, run_chain(logp, inits[i], child))
+    i = i + 1
+  }
+  out
+}

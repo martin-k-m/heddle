@@ -1,0 +1,228 @@
+mode systems
+
+# hmc.tw: the leapfrog integrator, the Hamiltonian, and static Hamiltonian
+# Monte Carlo.
+#
+# WHY HAMILTONIAN AT ALL
+#
+# A random walk proposal in d dimensions has to take steps small enough to be
+# accepted, and the acceptable step shrinks as d grows, so the number of draws
+# needed for one effectively independent sample grows like d^2. HMC introduces
+# a momentum, follows the resulting Hamiltonian dynamics for a while, and
+# proposes the endpoint. The dynamics conserve the total energy exactly, so a
+# perfectly integrated trajectory is accepted with probability one no matter how
+# far it travelled. Discretisation error is what makes the probability less than
+# one, and the leapfrog's error is what the step size adaptation is fighting.
+#
+# The gradient is the entire mechanism. Without it there is no force, no
+# trajectory, and nothing to distinguish HMC from a random walk. This is why
+# heddle exists in a language with `grad` rather than beside one.
+#
+# THE HAMILTONIAN
+#
+#   H(q, p) = -log p(q) + 0.5 * p' M^-1 p
+#
+# The potential energy is the negative log posterior, so the particle rolls
+# downhill toward high posterior density, and the kinetic energy is the
+# quadratic form the mass matrix defines. The joint density exp(-H) has the
+# posterior as its q-marginal, which is the fact that makes any of this a valid
+# sampler: drawing a momentum from N(0, M) and then moving along a level set of
+# H leaves the joint distribution alone, and throwing the momentum away at the
+# end leaves the posterior.
+
+import "std/random" as random
+import "src/vec.tw" as vec
+import "src/model.tw" as model
+
+# A point on a trajectory: position, momentum, and the value and gradient of
+# the log density there.
+#
+# The gradient is carried rather than recomputed because the leapfrog's next
+# half step needs the gradient at the position it just moved to, which is the
+# same gradient the following full step needs. Recomputing would double the
+# cost of the only expensive operation in the whole sampler.
+struct Point {
+  q: Arr[F64],
+  p: Arr[F64],
+  grad: Arr[F64],
+  logp: F64,
+}
+
+fn point_at(logp: fn(Tensor) -> Tensor, q: Arr[F64], p: Arr[F64]) -> Point {
+  let d = model.value_and_gradient(logp, q)
+  Point { q: q, p: p, grad: d.grad, logp: d.value }
+}
+
+fn copy_point(pt: Point) -> Point =
+  Point { q: vec.copy(pt.q), p: vec.copy(pt.p), grad: vec.copy(pt.grad), logp: pt.logp }
+
+# ---- momentum ---------------------------------------------------------------
+
+# p ~ N(0, M). `inv_mass` holds the diagonal of M^-1, so the standard deviation
+# of coordinate i is 1/sqrt(inv_mass_i).
+#
+# This is the direction that is easy to invert. Drawing with standard deviation
+# sqrt(inv_mass_i) instead gives a sampler that runs, produces a plausible
+# trace, and targets the wrong distribution, because the momentum's
+# distribution and the kinetic energy no longer agree and the joint density is
+# not exp(-H). The symptom is a persistent energy drift that the step size
+# adaptation tries to fix by shrinking the step forever.
+fn draw_momentum(r: random.Rng, inv_mass: Arr[F64]) -> Arr[F64] {
+  let p: Arr[F64] = []
+  let i: I64 = 0
+  while i < len(inv_mass) {
+    push(p, random.normal(r) / f64_sqrt(inv_mass[i]))
+    i = i + 1
+  }
+  p
+}
+
+# H(q, p), the total energy. Returned as the negative, `-H`, throughout heddle,
+# because every use of it is inside an exp of a difference and the negation
+# would otherwise appear at every call site with a chance of being dropped at
+# one of them.
+fn neg_energy(pt: Point, inv_mass: Arr[F64]) -> F64 =
+  pt.logp - vec.quad_form(pt.p, inv_mass)
+
+# ---- the leapfrog -----------------------------------------------------------
+#
+#   p <- p + (eps/2) * grad log p(q)
+#   q <- q + eps * M^-1 p
+#   p <- p + (eps/2) * grad log p(q_new)
+#
+# Half step, full step, half step. The symmetry is not a stylistic choice: it
+# is what makes the integrator reversible and volume preserving, and both are
+# required for the Metropolis correction to be valid. An Euler step is simpler,
+# is neither, and gives a sampler that is systematically wrong rather than
+# merely inaccurate.
+#
+# The gradient sign is plus, because the potential is the negative log density
+# and the force is the negative gradient of the potential, so the two negations
+# cancel. Getting this backwards produces a particle that rolls uphill, away
+# from the posterior mode, and the trace looks like a divergent chain rather
+# than like a sign error.
+fn leapfrog(logp: fn(Tensor) -> Tensor, pt: Point, eps: F64, inv_mass: Arr[F64]) -> Point {
+  let p_half: Arr[F64] = vec.axpy(pt.p, 0.5 * eps, pt.grad)
+
+  let q_new: Arr[F64] = vec.copy(pt.q)
+  let i: I64 = 0
+  while i < len(q_new) {
+    q_new[i] = q_new[i] + eps * inv_mass[i] * p_half[i]
+    i = i + 1
+  }
+
+  let d = model.value_and_gradient(logp, q_new)
+
+  # A non-finite density here means the step left the support. The point is
+  # returned as it stands rather than being repaired: the caller's divergence
+  # test reads the energy, and a repaired point would pass that test while
+  # being nowhere.
+  let p_new: Arr[F64] = vec.axpy(p_half, 0.5 * eps, d.grad)
+
+  Point { q: q_new, p: p_new, grad: d.grad, logp: d.value }
+}
+
+# ---- divergence -------------------------------------------------------------
+#
+# A trajectory is divergent when the energy error has grown past a threshold.
+# The energy is conserved by the exact dynamics, so a large error means the
+# discretisation has failed, and it fails where the posterior's curvature is
+# high relative to the step size. That is not a random event: it happens in a
+# specific region, so a run with divergences has systematically under-sampled a
+# specific part of the posterior.
+#
+# This is why `src/diag.tw` treats the divergence count as a first-class
+# output. A divergent run's posterior is biased, and the bias is invisible in
+# the draws themselves: the trace looks fine, R-hat can be 1.00, and the
+# answer is still wrong. The count is the only thing that says so.
+#
+# The threshold of 1000 is the conventional one. It is enormous, deliberately:
+# it is not trying to catch inaccuracy, it is trying to catch the integrator
+# having fallen off a cliff, and the energy error in that case is not 1001, it
+# is 10^12 or a NaN. A threshold tuned finer would flag ordinary error.
+let DIVERGENCE_THRESHOLD: F64 = 1000.0
+
+fn is_divergent(h0: F64, h: F64) -> Bool {
+  if not vec.is_finite(h) {
+    return true
+  }
+  h0 - h > DIVERGENCE_THRESHOLD
+}
+
+# ---- static HMC -------------------------------------------------------------
+#
+# A fixed number of leapfrog steps, then one Metropolis accept or reject on the
+# endpoint.
+#
+# It is here because it is the thing NUTS is an improvement on, and because it
+# is much easier to check: the whole of `hmc_draw` is twenty lines and its
+# correctness is the standard Metropolis argument. A NUTS implementation that
+# disagrees with static HMC on a Gaussian has a bug in the tree, and
+# `tests/hmc_test.tw` is that comparison.
+#
+# Its defect is the fixed L. Too small and the trajectory does not leave the
+# neighbourhood; too large and it U-turns and comes back, spending gradient
+# evaluations to return to where it started. There is no L that is right for
+# every posterior and no L that is right for one posterior in every region of
+# it. NUTS chooses L per draw, which is its entire contribution.
+
+struct DrawResult {
+  q: Arr[F64],
+  logp: F64,
+  accepted: Bool,
+  divergent: Bool,
+  accept_stat: F64,
+  steps: I64,
+  depth: I64,
+  energy: F64,
+}
+
+fn hmc_draw(logp: fn(Tensor) -> Tensor, r: random.Rng, q: Arr[F64],
+            eps: F64, steps: I64, inv_mass: Arr[F64]) -> DrawResult {
+  let p0: Arr[F64] = draw_momentum(r, inv_mass)
+  let start: Point = point_at(logp, vec.copy(q), p0)
+  let h0: F64 = neg_energy(start, inv_mass)
+
+  let cur: Point = start
+  let divergent: Bool = false
+  let i: I64 = 0
+  while i < steps {
+    cur = leapfrog(logp, cur, eps, inv_mass)
+    if is_divergent(h0, neg_energy(cur, inv_mass)) {
+      divergent = true
+      i = steps
+    } else {
+      i = i + 1
+    }
+  }
+
+  let h: F64 = neg_energy(cur, inv_mass)
+  let log_ratio: F64 = h - h0
+
+  # min(1, exp(log_ratio)), computed without exponentiating a large positive
+  # number. The accept statistic is reported whether or not the draw was
+  # accepted, because it is what dual averaging consumes.
+  let accept_stat: F64 = 1.0
+  if log_ratio < 0.0 {
+    accept_stat = f64_exp(log_ratio)
+  }
+  if not vec.is_finite(log_ratio) {
+    accept_stat = 0.0
+  }
+
+  if divergent {
+    return DrawResult { q: vec.copy(q), logp: start.logp, accepted: false,
+                        divergent: true, accept_stat: 0.0, steps: steps,
+                        depth: 0, energy: h0 }
+  }
+
+  if random.uniform(r) < accept_stat {
+    return DrawResult { q: cur.q, logp: cur.logp, accepted: true,
+                        divergent: false, accept_stat: accept_stat,
+                        steps: steps, depth: 0, energy: h }
+  }
+
+  DrawResult { q: vec.copy(q), logp: start.logp, accepted: false,
+               divergent: false, accept_stat: accept_stat, steps: steps,
+               depth: 0, energy: h0 }
+}

@@ -1,0 +1,354 @@
+mode systems
+
+# adapt.tw: the two things warmup tunes, and the schedule that tunes them.
+#
+# A Hamiltonian sampler has two knobs and gets no useful posterior without
+# both of them being roughly right.
+#
+#   step size   too large and the leapfrog integrator diverges, the energy
+#               error explodes, and every proposal is rejected. Too small and
+#               the trajectory covers no ground per unit of work, so the chain
+#               is correct and useless.
+#
+#   mass matrix the metric on parameter space. A posterior whose coordinates
+#               differ in scale by a factor of a thousand is, to a sampler with
+#               an identity metric, a very long thin valley. The step size is
+#               then limited by the narrowest direction while the distance to
+#               cover is set by the widest, and the ratio of those is the
+#               number of steps per effective draw.
+#
+# Both are tuned during warmup and both are frozen afterwards. Frozen is not
+# an optimisation: an adaptive kernel does not leave the posterior invariant,
+# so draws taken while adaptation is running are not draws from the posterior.
+# They are discarded. `src/nuts.tw` discards them and says so in the summary
+# rather than quietly including them.
+
+import "src/vec.tw" as vec
+
+# ---- dual averaging ---------------------------------------------------------
+#
+# Nesterov's dual averaging, as adapted for step size in Hoffman and Gelman's
+# NUTS paper. The objective is to drive the average acceptance statistic to a
+# target.
+#
+# Why dual averaging rather than a simple multiplicative rule ("if accept rate
+# is high, grow the step; if low, shrink it"). The acceptance statistic from a
+# single draw is extremely noisy, so a per-draw multiplicative rule random
+# walks and never settles. Dual averaging accumulates the whole history of the
+# error and takes a shrinking step against it, so the iterate converges rather
+# than wanders. The averaged iterate `log_eps_bar`, not the current one, is
+# what gets frozen at the end of warmup: the current iterate is still jittering
+# by design, because jitter is what keeps the estimate exploring.
+#
+# THE TARGET
+#
+# 0.8 by default. The theoretical optimum for HMC on a Gaussian is 0.65, and
+# 0.8 is used anyway because real posteriors are not Gaussian and the cost of
+# being slightly too conservative is a few extra leapfrog steps, while the cost
+# of being too aggressive is divergences, and divergences are a biased
+# posterior rather than a slow one. Raising the target to 0.95 or 0.99 is the
+# standard response to a model that reports divergences, and it works by
+# forcing a smaller step size.
+#
+# THE PARAMETERS
+#
+#   gamma  0.05   how hard the iterate is pulled toward the error. Larger
+#                 adapts faster and settles noisier.
+#   t0     10     an offset that damps the first few iterations, which are the
+#                 ones with the least information and the largest influence.
+#   kappa  0.75   the decay of the averaging weight. Must be in (0.5, 1] for
+#                 the averaged iterate to converge.
+#   mu            log(10 * eps_init). The point the iterate is shrunk toward.
+#                 Ten times the initial step, not the initial step itself,
+#                 because the initialisation heuristic is biased small and
+#                 shrinking toward it would keep it there.
+
+struct DualAvg {
+  mu: F64,
+  target: F64,
+  gamma: F64,
+  t0: F64,
+  kappa: F64,
+  log_eps: F64,
+  log_eps_bar: F64,
+  h_bar: F64,
+  count: I64,
+}
+
+fn dual_avg(eps_init: F64, target: F64) -> DualAvg {
+  DualAvg {
+    mu: f64_log(10.0 * eps_init),
+    target: target,
+    gamma: 0.05,
+    t0: 10.0,
+    kappa: 0.75,
+    log_eps: f64_log(eps_init),
+    # The averaged iterate starts at log(1) = 0 with zero weight, so the first
+    # update sets it outright. Starting it at log_eps instead would give the
+    # initial guess a permanent vote.
+    log_eps_bar: 0.0,
+    h_bar: 0.0,
+    count: 0,
+  }
+}
+
+# One update from one draw's acceptance statistic.
+#
+# `accept_stat` is the average Metropolis acceptance probability over the whole
+# trajectory, not whether the draw was accepted. For NUTS the distinction is
+# essential: NUTS draws a point from the trajectory by multinomial sampling and
+# is not accept-or-reject in the usual sense, so a binary indicator would carry
+# almost no information. The average over the tree's states is the statistic
+# the dual averaging scheme was derived for.
+fn dual_avg_update(d: DualAvg, accept_stat: F64) {
+  d.count = d.count + 1
+  let m: F64 = f64_of_i64(d.count)
+
+  let eta: F64 = 1.0 / (m + d.t0)
+  d.h_bar = (1.0 - eta) * d.h_bar + eta * (d.target - accept_stat)
+
+  d.log_eps = d.mu - f64_sqrt(m) / d.gamma * d.h_bar
+
+  let w: F64 = f64_pow(m, 0.0 - d.kappa)
+  d.log_eps_bar = w * d.log_eps + (1.0 - w) * d.log_eps_bar
+}
+
+# The step to use right now, during warmup.
+fn dual_avg_current(d: DualAvg) -> F64 = f64_exp(d.log_eps)
+
+# The step to freeze at the end of warmup.
+fn dual_avg_final(d: DualAvg) -> F64 = f64_exp(d.log_eps_bar)
+
+# Restart the scheme around a new centre. Called at the end of each mass matrix
+# window, because a changed metric changes what step size means: the same
+# numeric step is a different distance under a different mass, and the
+# accumulated error history is about the old one.
+fn dual_avg_restart(d: DualAvg, eps: F64) {
+  d.mu = f64_log(10.0 * eps)
+  d.log_eps = f64_log(eps)
+  d.log_eps_bar = 0.0
+  d.h_bar = 0.0
+  d.count = 0
+}
+
+# ---- the diagonal mass matrix -----------------------------------------------
+#
+# Diagonal, not dense. A dense metric would capture correlations and would cost
+# d^2 storage, a Cholesky per window, and an estimate that needs more draws
+# than the window has for any d worth using it on. The diagonal captures scale,
+# which is the part that varies by orders of magnitude, and leaves correlation
+# to the sampler. For the funnel-shaped posteriors where correlation is the
+# problem, no metric fixes it and a reparameterisation does.
+#
+# The estimate is the posterior variance of each coordinate, and the inverse
+# mass is set to it. That is the right direction and it is easy to get
+# backwards: M^-1 = Var(q), so a coordinate with a wide posterior gets a large
+# inverse mass and therefore a light particle that moves far per unit of
+# momentum. Setting M = Var(q) instead makes the wide directions heavy and the
+# sampler slower than with no metric at all.
+#
+# Welford's online algorithm rather than accumulating a sum of squares. The
+# naive form subtracts two large nearly equal numbers and loses most of its
+# precision when the mean is far from zero, which for an unconstrained
+# coordinate near a large mode it is.
+
+struct Welford {
+  n: I64,
+  mean: Arr[F64],
+  m2: Arr[F64],
+}
+
+fn welford(dim: I64) -> Welford =
+  Welford { n: 0, mean: vec.zeros(dim), m2: vec.zeros(dim) }
+
+fn welford_add(w: Welford, q: Arr[F64]) {
+  w.n = w.n + 1
+  let inv: F64 = 1.0 / f64_of_i64(w.n)
+  let i: I64 = 0
+  while i < len(q) {
+    let delta: F64 = q[i] - w.mean[i]
+    w.mean[i] = w.mean[i] + delta * inv
+    # The second delta uses the updated mean. Using the same delta twice is the
+    # classic transcription error and it produces a variance that is too small
+    # by a factor that grows with n.
+    w.m2[i] = w.m2[i] + delta * (q[i] - w.mean[i])
+    i = i + 1
+  }
+}
+
+fn welford_reset(w: Welford, dim: I64) {
+  w.n = 0
+  w.mean = vec.zeros(dim)
+  w.m2 = vec.zeros(dim)
+}
+
+# The variance estimate, regularised toward one.
+#
+# The regularisation is Stan's and it is not cosmetic. A window may hold only
+# 25 draws, and a variance estimated from 25 highly autocorrelated draws is
+# noisy enough that a coordinate can come out near zero by luck. A near-zero
+# inverse mass makes that coordinate effectively frozen, and the next window
+# then sees no variation in it and confirms the freeze. The shrinkage toward 1
+# is what stops that from being a fixed point.
+fn welford_variance(w: Welford) -> Arr[F64] {
+  let out: Arr[F64] = []
+  if w.n < 2 {
+    # Not enough to estimate anything. The identity metric is the honest
+    # answer and the next window will do better.
+    return vec.ones(len(w.mean))
+  }
+  let n: F64 = f64_of_i64(w.n)
+  let shrink: F64 = n / (n + 5.0)
+  let i: I64 = 0
+  while i < len(w.m2) {
+    let v: F64 = w.m2[i] / (n - 1.0)
+    push(out, shrink * v + (1.0 - shrink) * 0.001)
+    i = i + 1
+  }
+  out
+}
+
+# ---- the warmup schedule ----------------------------------------------------
+#
+# Stan's three-stage schedule, and the reason it has three stages rather than
+# one is that the two knobs interfere.
+#
+#   Stage I    an initial fast interval. Step size adapts, the metric does not.
+#              The chain is probably still travelling toward the typical set,
+#              and variance estimated on the way there describes the journey
+#              rather than the destination.
+#
+#   Stage II   a sequence of doubling windows. At the end of each, the metric
+#              is updated from that window's draws and the step size scheme is
+#              restarted around the current step. Windows double because a
+#              better metric produces better draws, so later windows deserve
+#              more of the budget, and because a fixed window size would either
+#              be too short early or waste the budget late.
+#
+#   Stage III  a final fast interval. The metric is frozen and only the step
+#              size adapts. Without this the sampler leaves warmup with a step
+#              size tuned for the metric it had one window ago.
+#
+# The defaults are 75 / expanding from 25 / 50, which need a warmup of at least
+# 150 draws to make sense. Below that the schedule collapses to step size
+# adaptation alone, which is stated in `is_window_end` rather than silently
+# producing a one-draw window.
+
+struct Schedule {
+  warmup: I64,
+  init_buffer: I64,
+  term_buffer: I64,
+  base_window: I64,
+  window_start: I64,
+  window_end: I64,
+}
+
+fn schedule(warmup: I64) -> Schedule {
+  let init_buffer: I64 = 75
+  let term_buffer: I64 = 50
+  let base: I64 = 25
+
+  if warmup < init_buffer + term_buffer + base {
+    # Too short for a metric estimate worth having. Step size only, and the
+    # window is set past the end so `is_window_end` never fires.
+    return Schedule {
+      warmup: warmup,
+      init_buffer: warmup,
+      term_buffer: 0,
+      base_window: 0,
+      window_start: warmup + 1,
+      window_end: warmup + 1,
+    }
+  }
+
+  Schedule {
+    warmup: warmup,
+    init_buffer: init_buffer,
+    term_buffer: term_buffer,
+    base_window: base,
+    window_start: init_buffer,
+    window_end: init_buffer + base,
+  }
+}
+
+# Whether draw `i` (zero based, within warmup) contributes to the metric.
+fn in_window(s: Schedule, i: I64) -> Bool =
+  i >= s.window_start and i < s.warmup - s.term_buffer
+
+fn is_window_end(s: Schedule, i: I64) -> Bool {
+  if s.base_window == 0 {
+    return false
+  }
+  if i < s.window_start {
+    return false
+  }
+  if i >= s.warmup - s.term_buffer {
+    return false
+  }
+  i == s.window_end - 1
+}
+
+# Advance to the next window, doubling it. If the doubled window would run past
+# the start of the terminal buffer, it is extended to end there instead of
+# being cut short: a final window of three draws would produce a metric worse
+# than the one it replaces.
+fn next_window(s: Schedule) {
+  let limit: I64 = s.warmup - s.term_buffer
+  s.window_start = s.window_end
+  s.base_window = 2 * s.base_window
+
+  let candidate: I64 = s.window_start + s.base_window
+  # The look-ahead is what stops the last window from being a stub. If the
+  # window after this one could not fit, this one absorbs the remainder.
+  if candidate + 2 * s.base_window > limit {
+    s.window_end = limit
+  } else {
+    s.window_end = candidate
+  }
+}
+
+# ---- an initial step size ---------------------------------------------------
+#
+# The heuristic from the NUTS paper: take one leapfrog step, and double or halve
+# the step size until the acceptance probability crosses 0.5. It is crude and
+# it only has to land within an order of magnitude, because dual averaging does
+# the rest. Its value is in avoiding the two catastrophic starts: a step so
+# large that the very first trajectory diverges and dual averaging has no
+# signal, and a step so small that warmup is spent climbing.
+#
+# The caller supplies the one-step energy error function, because the step
+# depends on the integrator and this module does not own one.
+fn initial_step_search(log_accept_at: fn(F64) -> F64) -> F64 {
+  let eps: F64 = 1.0
+  let a: F64 = log_accept_at(eps)
+
+  # Which way to move. Threshold at log(0.5) so the search stops as soon as it
+  # crosses, rather than converging to it.
+  let target: F64 = 0.0 - 0.6931471805599453
+  let direction: F64 = 2.0
+  if a < target {
+    direction = 0.5
+  }
+
+  let i: I64 = 0
+  while i < 100 {
+    if direction > 1.0 {
+      if a <= target {
+        return eps
+      }
+    } else {
+      if a >= target {
+        return eps
+      }
+    }
+    eps = eps * direction
+    a = log_accept_at(eps)
+    i = i + 1
+  }
+
+  # A hundred doublings is a factor of 2^100. Reaching here means the density
+  # is not responding to the step size at all, which is a broken model rather
+  # than a hard one, and returning the last value lets the caller's diagnostics
+  # report it instead of this function guessing.
+  eps
+}

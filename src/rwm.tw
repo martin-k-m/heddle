@@ -1,0 +1,193 @@
+mode systems
+
+# rwm.tw: random walk Metropolis.
+#
+# The simplest correct sampler, and it is in heddle for three reasons that are
+# not sentiment.
+#
+# It needs no gradient. A model with a discrete parameter, a hard threshold, or
+# a likelihood computed by a black box that twill cannot differentiate has no
+# gradient to give NUTS, and a slow sampler that runs is better than a fast one
+# that cannot start.
+#
+# It is a reference. Random walk Metropolis on a known target converges to the
+# right answer given enough draws, and its correctness rests on the single
+# Metropolis ratio below rather than on a tree. `tests/nuts_test.tw` compares
+# NUTS against it on a target whose moments are known, which is the only way to
+# catch a NUTS bug that biases the posterior slightly rather than breaking it.
+#
+# It sets the bar. If NUTS is not comfortably beating this on effective sample
+# size per gradient evaluation, something is wrong with the step size or the
+# metric, and that is worth being able to check.
+#
+# WHAT IT COSTS
+#
+# The proposal has to shrink as the dimension grows for the acceptance rate to
+# stay reasonable, so the chain moves a distance per draw that falls with
+# dimension while the distance it needs to cover does not. The number of draws
+# per effectively independent sample grows roughly with the square of the
+# dimension. At d = 2 that is nothing. At d = 200 it is the difference between
+# a second and a week.
+
+import "std/random" as random
+import "src/vec.tw" as vec
+import "src/model.tw" as model
+import "src/hmc.tw" as hmc
+import "src/chain.tw" as chain
+
+# The optimal acceptance rate for a random walk on a high-dimensional Gaussian
+# target is 0.234, which is a genuinely surprising number and is not a typo. It
+# falls out of the diffusion limit as d grows. For small d the optimum is
+# higher, around 0.44 in one dimension, and 0.234 is used regardless because
+# the loss from being slightly off is shallow and a d-dependent target would be
+# one more thing to get wrong.
+let RWM_TARGET_ACCEPT: F64 = 0.234
+
+struct RwmConfig {
+  warmup: I64,
+  draws: I64,
+  seed: I64,
+  init_scale: F64,
+}
+
+fn rwm_config(warmup: I64, draws: I64, seed: I64) -> RwmConfig =
+  RwmConfig { warmup: warmup, draws: draws, seed: seed, init_scale: 1.0 }
+
+# One draw. A Gaussian proposal with a per-coordinate scale, and the Metropolis
+# ratio.
+#
+# The proposal is symmetric, so the Hastings correction is one and the
+# acceptance probability is min(1, p(q')/p(q)). Symmetry is the reason the
+# proposal distribution does not appear in the ratio, and it is why an
+# asymmetric proposal added later without also adding the correction gives a
+# sampler that is quietly wrong.
+fn rwm_draw(logp: fn(Tensor) -> Tensor, r: random.Rng, q: Arr[F64],
+            logp_q: F64, scale: Arr[F64]) -> hmc.DrawResult {
+
+  let prop: Arr[F64] = vec.copy(q)
+  let i: I64 = 0
+  while i < len(prop) {
+    prop[i] = prop[i] + scale[i] * random.normal(r)
+    i = i + 1
+  }
+
+  let lp: F64 = model.log_density(logp, prop)
+
+  # A non-finite proposal density is a rejection, not an error. It means the
+  # proposal left the support, which for a bounded parameter is the normal
+  # case rather than the exceptional one.
+  let ratio: F64 = lp - logp_q
+  let a: F64 = 1.0
+  if not vec.is_finite(lp) {
+    a = 0.0
+  } else if ratio < 0.0 {
+    a = f64_exp(ratio)
+  }
+
+  if random.uniform(r) < a {
+    return hmc.DrawResult { q: prop, logp: lp, accepted: true, divergent: false,
+                            accept_stat: a, steps: 1, depth: 0, energy: 0.0 - lp }
+  }
+
+  hmc.DrawResult { q: vec.copy(q), logp: logp_q, accepted: false, divergent: false,
+                   accept_stat: a, steps: 1, depth: 0, energy: 0.0 - logp_q }
+}
+
+# The run. During warmup the proposal scale adapts by a Robbins-Monro rule
+# toward the target acceptance, and the empirical standard deviation of the
+# warmup draws sets the per-coordinate shape.
+#
+# Two separate things, adapted separately and for different reasons. The shape
+# fixes the relative scale of the coordinates, which is the same problem the
+# mass matrix solves for HMC. The overall scale fixes the acceptance rate. A
+# scheme that adapted only the overall scale would end up limited by the
+# narrowest coordinate exactly as an identity-metric HMC is.
+#
+# Adaptation stops at the end of warmup, for the reason `src/adapt.tw` gives:
+# an adapting chain does not leave the target invariant, so adapting draws are
+# not posterior draws.
+fn run_chain(logp: fn(Tensor) -> Tensor, q_init: Arr[F64], cfg: RwmConfig) -> chain.Chain {
+  let r: random.Rng = random.new_rng(cfg.seed)
+  let dim: I64 = len(q_init)
+  let q: Arr[F64] = vec.copy(q_init)
+  let lp: F64 = model.log_density(logp, q)
+
+  let scale: Arr[F64] = vec.filled(dim, cfg.init_scale)
+  let log_s: F64 = 0.0
+
+  # Running mean and sum of squares for the coordinate shape.
+  let mean: Arr[F64] = vec.zeros(dim)
+  let m2: Arr[F64] = vec.zeros(dim)
+  let n_seen: I64 = 0
+
+  let i: I64 = 0
+  while i < cfg.warmup {
+    let res = rwm_draw(logp, r, q, lp, scale)
+    q = res.q
+    lp = res.logp
+
+    # Robbins-Monro on the log scale. The 1/(i+1) gain is what makes it settle
+    # rather than oscillate, and the log keeps the scale positive without a
+    # clamp.
+    let gain: F64 = 1.0 / f64_of_i64(i + 10)
+    log_s = log_s + gain * (res.accept_stat - RWM_TARGET_ACCEPT)
+
+    n_seen = n_seen + 1
+    let inv: F64 = 1.0 / f64_of_i64(n_seen)
+    let j: I64 = 0
+    while j < dim {
+      let delta: F64 = q[j] - mean[j]
+      mean[j] = mean[j] + delta * inv
+      m2[j] = m2[j] + delta * (q[j] - mean[j])
+      j = j + 1
+    }
+
+    # The shape is refreshed periodically rather than every draw, because a
+    # scale that moves every draw makes the chain's own history part of the
+    # kernel in a way that is hard to reason about even during warmup.
+    if n_seen > 50 and n_seen % 50 == 0 {
+      j = 0
+      while j < dim {
+        let sd: F64 = f64_sqrt(m2[j] / f64_of_i64(n_seen - 1))
+        if sd > 0.0 {
+          # 2.38/sqrt(d) is the scaling that achieves the 0.234 acceptance on a
+          # Gaussian target, and it is the reason the target above is what it
+          # is. The adapted `log_s` corrects the rest.
+          scale[j] = 2.38 / f64_sqrt(f64_of_i64(dim)) * sd * f64_exp(log_s)
+        }
+        j = j + 1
+      }
+    }
+
+    i = i + 1
+  }
+
+  let ds: Arr[Arr[F64]] = []
+  let lps: Arr[F64] = []
+  let acc: Arr[F64] = []
+  let dep: Arr[I64] = []
+  let nlf: Arr[I64] = []
+  let div: Arr[Bool] = []
+  let en: Arr[F64] = []
+
+  i = 0
+  while i < cfg.draws {
+    let res = rwm_draw(logp, r, q, lp, scale)
+    q = res.q
+    lp = res.logp
+    push(ds, vec.copy(q))
+    push(lps, lp)
+    push(acc, res.accept_stat)
+    push(dep, 0)
+    push(nlf, 1)
+    push(div, false)
+    push(en, res.energy)
+    i = i + 1
+  }
+
+  chain.Chain {
+    draws: ds, logp: lps, accept_stat: acc, depth: dep, n_leapfrog: nlf,
+    divergent: div, energy: en, step_size: f64_exp(log_s), inv_mass: scale,
+    n_divergent: 0, n_max_depth: 0, seed: cfg.seed,
+  }
+}

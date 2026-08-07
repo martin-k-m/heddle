@@ -1,0 +1,137 @@
+mode systems
+
+# chain.tw: what a sampler returns, and how to read one coordinate out of it.
+#
+# One struct, shared by every sampler, so that `src/diag.tw` and the summary
+# table work on a NUTS run and a random walk run without knowing which they
+# have. The fields a random walk cannot fill are filled with values that are
+# honestly empty rather than plausible: zero divergences because there are
+# none, depth zero because there is no tree.
+#
+# The sampler statistics live here beside the draws rather than being printed
+# during the run. A run whose acceptance statistics were printed and discarded
+# cannot be diagnosed afterwards, and the moment anyone wants to diagnose a run
+# is after it finished and looked wrong.
+
+import "src/vec.tw" as vec
+
+struct Chain {
+  # draws[i] is the parameter vector at draw i, in the unconstrained space.
+  # Unconstrained, because that is where the sampler lives and converting on
+  # the way out would mean every diagnostic ran on transformed numbers. R-hat
+  # on a log-scale parameter and R-hat on the scale itself are different
+  # questions and the unconstrained one is the one about the sampler.
+  draws: Arr[Arr[F64]],
+  logp: Arr[F64],
+  accept_stat: Arr[F64],
+  depth: Arr[I64],
+  n_leapfrog: Arr[I64],
+  divergent: Arr[Bool],
+  energy: Arr[F64],
+  step_size: F64,
+  inv_mass: Arr[F64],
+  n_divergent: I64,
+  n_max_depth: I64,
+  seed: I64,
+}
+
+fn new_chain(seed: I64, dim: I64) -> Chain {
+  let ds: Arr[Arr[F64]] = []
+  let lp: Arr[F64] = []
+  let acc: Arr[F64] = []
+  let dep: Arr[I64] = []
+  let nlf: Arr[I64] = []
+  let div: Arr[Bool] = []
+  let en: Arr[F64] = []
+  Chain {
+    draws: ds, logp: lp, accept_stat: acc, depth: dep, n_leapfrog: nlf,
+    divergent: div, energy: en, step_size: 0.0, inv_mass: vec.ones(dim),
+    n_divergent: 0, n_max_depth: 0, seed: seed,
+  }
+}
+
+fn n_draws(c: Chain) -> I64 = len(c.draws)
+
+fn dim_of(c: Chain) -> I64 {
+  if len(c.draws) == 0 {
+    return 0
+  }
+  len(c.draws[0])
+}
+
+# One coordinate's series across the draws of one chain. Every diagnostic in
+# `src/diag.tw` operates on this, because R-hat and effective sample size are
+# per-parameter quantities and there is no useful multivariate summary of them
+# that anyone acts on.
+fn column(c: Chain, k: I64) -> Arr[F64] {
+  let out: Arr[F64] = []
+  let i: I64 = 0
+  while i < len(c.draws) {
+    push(out, c.draws[i][k])
+    i = i + 1
+  }
+  out
+}
+
+# The same coordinate across several chains, as a list of series. R-hat needs
+# the chains kept apart, since the whole quantity is a comparison of the
+# variance within them against the variance between them. Flattening them into
+# one array first is a mistake that makes R-hat come out as 1.00 always.
+fn columns(cs: Arr[Chain], k: I64) -> Arr[Arr[F64]] {
+  let out: Arr[Arr[F64]] = []
+  let i: I64 = 0
+  while i < len(cs) {
+    push(out, column(cs[i], k))
+    i = i + 1
+  }
+  out
+}
+
+fn total_divergences(cs: Arr[Chain]) -> I64 {
+  let n: I64 = 0
+  let i: I64 = 0
+  while i < len(cs) {
+    n = n + cs[i].n_divergent
+    i = i + 1
+  }
+  n
+}
+
+fn total_max_depth(cs: Arr[Chain]) -> I64 {
+  let n: I64 = 0
+  let i: I64 = 0
+  while i < len(cs) {
+    n = n + cs[i].n_max_depth
+    i = i + 1
+  }
+  n
+}
+
+fn total_draws(cs: Arr[Chain]) -> I64 {
+  let n: I64 = 0
+  let i: I64 = 0
+  while i < len(cs) {
+    n = n + len(cs[i].draws)
+    i = i + 1
+  }
+  n
+}
+
+fn mean_accept(cs: Arr[Chain]) -> F64 {
+  let s: F64 = 0.0
+  let n: I64 = 0
+  let i: I64 = 0
+  while i < len(cs) {
+    let j: I64 = 0
+    while j < len(cs[i].accept_stat) {
+      s = s + cs[i].accept_stat[j]
+      n = n + 1
+      j = j + 1
+    }
+    i = i + 1
+  }
+  if n == 0 {
+    return 0.0
+  }
+  s / f64_of_i64(n)
+}
