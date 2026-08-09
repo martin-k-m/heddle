@@ -39,6 +39,13 @@ fn a_vector_normal_density_is_the_sum_over_its_elements() {
   t.near("vector density sums", together, apart, 0.000000000001)
 }
 
+fn a_bernoulli_logit_density_matches_its_stable_softplus_form() {
+  # log p(y | z) = sum(y*z - softplus(z)). For y = [1, 0] and z = [2, -1]:
+  # (2 - log(1 + e^2)) + (0 - log(1 + e^-1)) = -0.126928 - 0.313262 = -0.440190.
+  let lp: F64 = vec.scalar_of(dist.bernoulli_logit_log_prob([1.0, 0.0], [2.0, -1.0]))
+  t.near("bernoulli logit density", lp, -0.440190, 0.00001)
+}
+
 fn the_gradient_of_a_normal_density_matches_a_finite_difference() {
   let h: F64 = 0.00001
   let f = fn(y: Tensor) -> Tensor = dist.normal_log_prob(y, scalar(0.3), scalar(1.7))
@@ -295,6 +302,7 @@ fn a_multinomial_draw_spends_exactly_its_trials() {
 the_standard_normal_density_at_zero_is_the_known_constant()
 a_normal_density_scales_by_its_standard_deviation_and_not_its_variance()
 a_vector_normal_density_is_the_sum_over_its_elements()
+a_bernoulli_logit_density_matches_its_stable_softplus_form()
 the_gradient_of_a_normal_density_matches_a_finite_difference()
 the_gradient_of_a_normal_density_with_respect_to_sigma_matches()
 the_half_normal_carries_twice_the_normal_density()

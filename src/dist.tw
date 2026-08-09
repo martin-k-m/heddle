@@ -96,6 +96,24 @@ fn normal_log_prob(y: Tensor, mu: Tensor, sigma: Tensor) -> Tensor {
   sum(0.0 - log(sigma) - 0.5 * LOG_TWO_PI - 0.5 * z * z)
 }
 
+# ---- bernoulli, by logit ----------------------------------------------------
+#
+# A binary outcome parameterised by its logit, the log odds, which is the form a
+# logistic regression or any linear classifier produces directly, so a model
+# does not have to pass its scores through a sigmoid before scoring them. `y` is
+# a vector of zeros and ones, `logits` the matching vector of scores.
+#
+#   log p(y | z) = y*z - softplus(z),   softplus(z) = log(1 + exp(z))
+#
+# softplus is written as relu(z) + log(1 + exp(-|z|)), not log(1 + exp(z)),
+# because exp of a confident positive logit overflows and the second form only
+# ever exponentiates a non-positive number. The two are equal for every z: for
+# z >= 0 it is z + log(1 + exp(-z)), and for z < 0 it is log(1 + exp(z)).
+fn bernoulli_logit_log_prob(y: Tensor, logits: Tensor) -> Tensor {
+  let softplus: Tensor = relu(logits) + log(1.0 + exp(0.0 - abs(logits)))
+  sum(y * logits - softplus)
+}
+
 fn normal_sample(r: random.Rng, mu: F64, sigma: F64) -> F64 =
   random.normal_with(r, mu, sigma)
 

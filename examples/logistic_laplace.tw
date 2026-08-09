@@ -1,0 +1,113 @@
+mode systems
+
+# logistic_laplace.tw: Bayesian logistic regression, fitted with Laplace.
+#
+# The simplest model with a genuinely useful posterior, and the case the Laplace
+# approximation was made for. A logistic regression has a log-concave posterior
+# under a Gaussian prior, so it has one mode and no awkward geometry, which is
+# exactly the shape Laplace fits without apology: the Gaussian it puts there is a
+# good approximation, not a hopeful one.
+#
+#   w ~ Normal(0, 2)                    a weak prior on the three weights
+#   y_i ~ Bernoulli(sigmoid(x_i . w))   each label from its linear score
+#
+# The point of doing it the Bayesian way rather than fitting a single set of
+# weights is the last section: a prediction carries its own uncertainty. A point
+# estimate says "62% class one" and cannot tell you whether that is 62% it would
+# stake its life on or 62% it made up, and near a decision boundary with little
+# data those are different situations that a calibrated model must distinguish.
+#
+# It fits in a moment, one Newton optimisation and one Cholesky, because the
+# Hessian it needs is second-order automatic differentiation of the same log
+# posterior and costs nothing beyond the arithmetic.
+
+import "../src/laplace.tw" as laplace
+import "../src/dist.tw" as dist
+import "../src/vec.tw" as vec
+import "std/random" as random
+
+# The design matrix: an intercept column and two features, twelve points. Two
+# loose clusters, class zero to the lower left and class one to the upper right,
+# overlapping enough not to be perfectly separable, which is the case where the
+# prior earns its keep by keeping the weights finite.
+let X: Tensor = [
+  [1.0, -1.2, -0.8], [1.0, -0.9, -1.5], [1.0, -1.8, -0.3],
+  [1.0, -0.4, -0.9], [1.0, -1.1, 0.2],  [1.0, -0.2, -1.7],
+  [1.0, 1.3, 0.9],   [1.0, 0.7, 1.6],   [1.0, 1.9, 0.4],
+  [1.0, 0.5, 1.1],   [1.0, 1.2, -0.2],  [1.0, 0.3, 1.8]
+]
+let Y: Tensor = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+
+# The log posterior over the weights [intercept, w1, w2]: the Bernoulli-logit
+# likelihood of the labels given the linear scores X . w, plus the Gaussian
+# prior. `@` is matrix by vector, so X . w is the length-twelve vector of scores.
+fn log_posterior(w: Tensor) -> Tensor {
+  let logits: Tensor = X @ w
+  dist.bernoulli_logit_log_prob(Y, logits) + dist.normal_log_prob(w, scalar(0.0), scalar(2.0))
+}
+
+# One prediction: the probability of class one at a point, given a weight vector.
+fn predict_prob(w: Arr[F64], x: Arr[F64]) -> F64 {
+  let z: F64 = vec.dot(w, x)
+  1.0 / (1.0 + f64_exp(0.0 - z))
+}
+
+# The predictive probability at a point, with its uncertainty, by pushing many
+# posterior weight draws through the model and summarising the spread. The mean
+# is the prediction; the standard deviation is how much the data left undecided.
+struct Predictive {
+  mean: F64,
+  sd: F64,
+}
+
+fn predictive_at(res: laplace.LaplaceResult, r: random.Rng, x: Arr[F64], draws: I64) -> Predictive {
+  let s: F64 = 0.0
+  let ss: F64 = 0.0
+  let i: I64 = 0
+  while i < draws {
+    let p: F64 = predict_prob(laplace.laplace_sample(res, r), x)
+    s = s + p
+    ss = ss + p * p
+    i = i + 1
+  }
+  let n: F64 = f64_of_i64(draws)
+  let mean: F64 = s / n
+  # E[p^2] - E[p]^2 can round just below zero when a prediction is near certain
+  # and the spread is essentially nil; clamp before the square root.
+  let var: F64 = ss / n - mean * mean
+  if var < 0.0 {
+    var = 0.0
+  }
+  Predictive { mean: mean, sd: f64_sqrt(var) }
+}
+
+# ---- the run ----------------------------------------------------------------
+
+let res = laplace.laplace_fit(log_posterior, [0.0, 0.0, 0.0], laplace.default_config())
+let sd = laplace.laplace_marginal_sd(res)
+
+print("Bayesian logistic regression by Laplace approximation")
+print("converged: " + str(res.converged) + " in " + str(res.iterations) + " Newton steps")
+print("")
+print("posterior mode, plus or minus one marginal standard deviation:")
+print("  intercept  " + str(res.mode[0]) + " +- " + str(sd[0]))
+print("  weight 1   " + str(res.mode[1]) + " +- " + str(sd[1]))
+print("  weight 2   " + str(res.mode[2]) + " +- " + str(sd[2]))
+print("")
+print("log evidence: " + str(res.log_evidence))
+print("  the Laplace approximation to log p(data), for comparing models")
+
+# Three test points: one deep in each class, and one on the boundary between
+# them, where a point estimate is most confidently wrong and the posterior
+# spread is largest.
+let r = random.new_rng(20260808)
+let deep_zero = predictive_at(res, r, [1.0, -1.5, -1.0], 4000)
+let deep_one = predictive_at(res, r, [1.0, 1.5, 1.0], 4000)
+let boundary = predictive_at(res, r, [1.0, 0.0, 0.0], 4000)
+
+print("")
+print("predicted P(class one), mean plus or minus posterior standard deviation:")
+print("  deep in class zero  " + str(deep_zero.mean) + " +- " + str(deep_zero.sd))
+print("  deep in class one   " + str(deep_one.mean) + " +- " + str(deep_one.sd))
+print("  on the boundary     " + str(boundary.mean) + " +- " + str(boundary.sd))
+print("  the boundary point's wider band is the uncertainty a point estimate hides")
