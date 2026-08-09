@@ -46,6 +46,15 @@ fn a_bernoulli_logit_density_matches_its_stable_softplus_form() {
   t.near("bernoulli logit density", lp, -0.440190, 0.00001)
 }
 
+fn a_poisson_log_density_matches_the_count_formula() {
+  # log p(y | log_lambda) = sum(y*log_lambda - lambda - log(y!)). For y = [2, 0]
+  # and log_lambda = [log 3, 0]: (2*log3 - 3 - log2) + (0 - 1 - 0)
+  # = -1.495923 - 1 = -2.495923.
+  let lp: F64 = vec.scalar_of(
+    dist.poisson_log_log_prob([2.0, 0.0], [1.0986122886681098, 0.0]))
+  t.near("poisson log density", lp, -2.495923, 0.00001)
+}
+
 fn the_gradient_of_a_normal_density_matches_a_finite_difference() {
   let h: F64 = 0.00001
   let f = fn(y: Tensor) -> Tensor = dist.normal_log_prob(y, scalar(0.3), scalar(1.7))
@@ -303,6 +312,7 @@ the_standard_normal_density_at_zero_is_the_known_constant()
 a_normal_density_scales_by_its_standard_deviation_and_not_its_variance()
 a_vector_normal_density_is_the_sum_over_its_elements()
 a_bernoulli_logit_density_matches_its_stable_softplus_form()
+a_poisson_log_density_matches_the_count_formula()
 the_gradient_of_a_normal_density_matches_a_finite_difference()
 the_gradient_of_a_normal_density_with_respect_to_sigma_matches()
 the_half_normal_carries_twice_the_normal_density()

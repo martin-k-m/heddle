@@ -114,6 +114,22 @@ fn bernoulli_logit_log_prob(y: Tensor, logits: Tensor) -> Tensor {
   sum(y * logits - softplus)
 }
 
+# ---- poisson, by log rate ---------------------------------------------------
+#
+# A count parameterised by the log of its rate, which is the log link a Poisson
+# regression uses, so the linear predictor is handed over directly rather than
+# exponentiated first. `y` is a vector of non-negative counts.
+#
+#   log p(y | log_lambda) = y*log_lambda - exp(log_lambda) - log(y!)
+#
+# The rate enters as its log throughout, so a linear predictor that is large and
+# negative gives a rate near zero without underflowing, and one that is large and
+# positive is the caller's problem, as it is for the rate itself. The log(y!)
+# term is lgamma(y + 1), the normalising constant kept for the same reason every
+# density here keeps it: an evidence is only comparable against a normalised one.
+fn poisson_log_log_prob(y: Tensor, log_lambda: Tensor) -> Tensor =
+  sum(y * log_lambda - exp(log_lambda) - lgamma(y + 1.0))
+
 fn normal_sample(r: random.Rng, mu: F64, sigma: F64) -> F64 =
   random.normal_with(r, mu, sigma)
 
