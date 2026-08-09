@@ -102,8 +102,9 @@ reparameterisation for it to work.
 | Static HMC, as a reference the tree can be checked against | written, unrun |
 | NUTS: multinomial sampling, generalised U-turn, dual averaging, diagonal mass | written, unrun |
 | Mean-field ADVI with the reparameterisation trick | written, unrun |
+| Laplace approximation: Newton to the mode, Gaussian from the Hessian | written, unrun |
 | Diagnostics: split rank-normalised R-hat, ESS, MCSE, divergences | written, unrun |
-| Dense mass matrix, Riemannian HMC, marginal likelihood | **not in v0.1** |
+| Dense mass matrix, Riemannian HMC | **not in v0.1** |
 | Discrete parameters and their marginalisation | **not in v0.1** |
 | Anything running end to end | **no** |
 

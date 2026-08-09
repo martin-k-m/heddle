@@ -1,0 +1,76 @@
+mode systems
+
+import "harness.tw" as t
+import "../src/laplace.tw" as laplace
+import "../src/dist.tw" as dist
+import "../src/vec.tw" as vec
+import "std/linalg" as linalg
+import "std/random" as random
+
+# A diagonal normal. The Laplace approximation of a Gaussian is exact, so the
+# mode is the mean and the marginal deviations are the standard deviations, to
+# optimisation tolerance rather than approximately.
+fn a_diagonal_normal(q: Tensor) -> Tensor =
+  dist.normal_log_prob(q, [2.0, -1.0], [0.5, 3.0])
+
+# A correlated normal, covariance [[1, 0.95], [0.95, 1]] through its Cholesky.
+# Mean field ADVI cannot represent the correlation and Laplace can, so the whole
+# covariance, off-diagonal included, should come back.
+fn a_correlated_normal(q: Tensor) -> Tensor {
+  let l: Tensor = [[1.0, 0.0], [0.95, 0.31224989991991997]]
+  dist.mvnormal_log_prob(q, [0.0, 0.0], l, 2)
+}
+
+fn laplace_recovers_the_mode_and_the_marginal_deviations() {
+  # Started away from the mode so Newton has to move, which for a Gaussian it
+  # does in a single exact step.
+  let res = laplace.laplace_fit(a_diagonal_normal, [0.0, 0.0], laplace.default_config())
+  t.equal_str("no error", res.err, "")
+  t.check("converged", res.converged)
+  t.near("mode of the first coordinate", res.mode[0], 2.0, 0.0001)
+  t.near("mode of the second", res.mode[1], -1.0, 0.0001)
+  let sd = laplace.laplace_marginal_sd(res)
+  t.near("marginal sd of the first", sd[0], 0.5, 0.0001)
+  t.near("marginal sd of the second", sd[1], 3.0, 0.0001)
+}
+
+fn laplace_recovers_the_full_covariance_including_correlation() {
+  let res = laplace.laplace_fit(a_correlated_normal, [1.0, 1.0], laplace.default_config())
+  t.equal_str("no error", res.err, "")
+  t.near("mode is at the origin", res.mode[0], 0.0, 0.0001)
+  t.near("the variance of the first coordinate", linalg.get(res.cov, 0, 0), 1.0, 0.001)
+  t.near("the off-diagonal covariance mean field would miss",
+    linalg.get(res.cov, 0, 1), 0.95, 0.001)
+}
+
+fn the_log_evidence_of_a_normalised_gaussian_is_zero() {
+  # A normalised density integrates to one, so its log evidence is zero, and
+  # Laplace is exact on a Gaussian, so it should report zero rather than merely
+  # near it.
+  let res = laplace.laplace_fit(a_diagonal_normal, [0.0, 0.0], laplace.default_config())
+  t.near("log evidence", res.log_evidence, 0.0, 0.001)
+}
+
+fn samples_average_to_the_mode() {
+  let res = laplace.laplace_fit(a_diagonal_normal, [0.0, 0.0], laplace.default_config())
+  let r = random.new_rng(20260808)
+  let sum0: F64 = 0.0
+  let sum1: F64 = 0.0
+  let n: I64 = 4000
+  let i: I64 = 0
+  while i < n {
+    let s = laplace.laplace_sample(res, r)
+    sum0 = sum0 + s[0]
+    sum1 = sum1 + s[1]
+    i = i + 1
+  }
+  # The sample mean of 4000 draws is within a few standard errors of the mode.
+  t.near("mean of the first coordinate", sum0 / f64_of_i64(n), 2.0, 0.05)
+  t.near("mean of the second", sum1 / f64_of_i64(n), -1.0, 0.2)
+}
+
+laplace_recovers_the_mode_and_the_marginal_deviations()
+laplace_recovers_the_full_covariance_including_correlation()
+the_log_evidence_of_a_normalised_gaussian_is_zero()
+samples_average_to_the_mode()
+t.report("laplace")

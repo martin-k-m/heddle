@@ -1,0 +1,273 @@
+mode systems
+
+# laplace.tw: the Laplace approximation.
+#
+# The cheapest posterior approximation there is, and the one every other method
+# in this library is heavier than. It finds the posterior mode and fits a
+# Gaussian there: the mean is the mode, and the covariance is the inverse of the
+# negative Hessian of the log density at the mode. That is the second-order
+# Taylor expansion of the log posterior exponentiated, so it is exact when the
+# posterior is Gaussian and a local approximation when it is not.
+#
+# It earns its place next to HMC and NUTS by being the thing to reach for first.
+# A run is one optimisation and one matrix factorisation rather than a hundred
+# thousand gradient evaluations, so it answers "roughly where is the mass and how
+# wide is it" in a moment, which is the question worth answering before deciding
+# whether the expensive samplers are needed at all. Its log evidence, below, is
+# also the standard cheap approximation for comparing two models.
+#
+# What it cannot do is bounded and worth stating. A posterior with more than one
+# mode is summarised by whichever the optimiser found; a skewed or heavy-tailed
+# one is reported as symmetric and lighter than it is; a parameter on a boundary
+# has no quadratic there and the covariance is meaningless. Reparameterise a
+# constrained parameter to the whole line first, exactly as the samplers want,
+# and the Gaussian is being fitted where it can be a good fit. src/transform.tw
+# is that reparameterisation.
+#
+# The Hessian is taken by second-order automatic differentiation. It is the same
+# `grad` the samplers use, differentiated a second time, so a model written for
+# HMC needs no change to be usable here.
+
+import "std/random" as random
+import "std/linalg" as linalg
+import "src/vec.tw" as vec
+import "src/model.tw" as model
+
+let LOG_TWO_PI: F64 = 1.8378770664093453
+
+struct LaplaceConfig {
+  # Newton iterations before giving up on the mode.
+  max_iter: I64,
+  # Convergence: the largest absolute gradient component below this is a mode.
+  tol: F64,
+}
+
+fn laplace_config(max_iter: I64, tol: F64) -> LaplaceConfig =
+  LaplaceConfig { max_iter: max_iter, tol: tol }
+
+# A hundred Newton steps is far more than a smooth posterior needs, and the
+# tolerance is tight because the gradient of a log density is cheap and there is
+# no reason to stop early.
+fn default_config() -> LaplaceConfig = laplace_config(100, 0.000001)
+
+struct LaplaceResult {
+  # The posterior mode, the Gaussian's mean.
+  mode: Arr[F64],
+  # The covariance, the inverse of the negative Hessian at the mode.
+  cov: linalg.Mat,
+  # The lower Cholesky factor of the covariance, cov = chol * chol^T, kept
+  # because sampling wants it and factoring it is how the fit checks that the
+  # covariance is positive definite in the first place.
+  chol: linalg.Mat,
+  # The Laplace approximation to the log marginal likelihood, for model
+  # comparison. logp(mode) + (d/2) log 2pi + half the log determinant of cov.
+  log_evidence: F64,
+  iterations: I64,
+  converged: Bool,
+  # Empty on success. A mode that is not a maximum, so the negative Hessian is
+  # not positive definite, is the usual reason this is set.
+  err: Str,
+}
+
+fn failed(msg: Str) -> LaplaceResult =
+  LaplaceResult { mode: [], cov: linalg.zeros(0, 0), chol: linalg.zeros(0, 0),
+                  log_evidence: 0.0, iterations: 0, converged: false, err: msg }
+
+# The Hessian of logp at q, as a Mat. `hessian(logp)` is the second-derivative
+# operator, the same shape as `grad`; evaluated at the point it returns the
+# [d, d] matrix, whose row-major data is exactly what a Mat holds.
+fn hessian_at(logp: fn(Tensor) -> Tensor, q: Arr[F64]) -> linalg.Mat {
+  let d: I64 = len(q)
+  let h: Tensor = hessian(logp)(vec.to_tensor(q))
+  linalg.Mat { rows: d, cols: d, data: vec.of_tensor(h) }
+}
+
+# The precision, -H, positive definite at a maximum.
+fn neg_mat(m: linalg.Mat) -> linalg.Mat {
+  let out: linalg.Mat = linalg.zeros(m.rows, m.cols)
+  let i: I64 = 0
+  while i < m.rows {
+    let j: I64 = 0
+    while j < m.cols {
+      linalg.set(out, i, j, 0.0 - linalg.get(m, i, j))
+      j = j + 1
+    }
+    i = i + 1
+  }
+  out
+}
+
+# A vector as a one-column Mat, and a one-column Mat back to a vector, for the
+# linear solve that produces the Newton step.
+fn col_of(v: Arr[F64]) -> linalg.Mat {
+  let m: linalg.Mat = linalg.zeros(len(v), 1)
+  let i: I64 = 0
+  while i < len(v) {
+    linalg.set(m, i, 0, v[i])
+    i = i + 1
+  }
+  m
+}
+
+fn col_to_arr(m: linalg.Mat) -> Arr[F64] {
+  let out: Arr[F64] = vec.zeros(m.rows)
+  let i: I64 = 0
+  while i < m.rows {
+    out[i] = linalg.get(m, i, 0)
+    i = i + 1
+  }
+  out
+}
+
+fn mat_finite(m: linalg.Mat) -> Bool {
+  let i: I64 = 0
+  while i < len(m.data) {
+    if not vec.is_finite(m.data[i]) {
+      return false
+    }
+    i = i + 1
+  }
+  true
+}
+
+# The Newton ascent direction P^{-1} g, or the gradient when that is not an
+# ascent direction. Near the mode P = -H is positive definite and P^{-1} g points
+# uphill; far from it H may not be negative definite, and then P^{-1} g can point
+# the wrong way, so the direction is checked and the gradient, which always
+# ascends, is used instead. The line search sizes whichever is returned.
+fn ascent_direction(p: linalg.Mat, g: Arr[F64]) -> Arr[F64] {
+  let delta: Arr[F64] = col_to_arr(linalg.solve(p, col_of(g)))
+  if vec.all_finite(delta) and vec.dot(g, delta) > 0.0 {
+    return delta
+  }
+  g
+}
+
+struct LineStep {
+  q: Arr[F64],
+  improved: Bool,
+}
+
+# Backtracking: the full step first, then halve until the log density strictly
+# increases. This is what lets Newton be used away from the mode without a trust
+# region: a step that would overshoot into lower density is shortened until it
+# does not, and a step that cannot improve the density at all is reported as no
+# improvement, which the caller reads as having reached the mode.
+fn line_search(logp: fn(Tensor) -> Tensor, q: Arr[F64], delta: Arr[F64], f0: F64) -> LineStep {
+  let t: F64 = 1.0
+  let tries: I64 = 0
+  while tries < 40 {
+    let q_try: Arr[F64] = vec.axpy(q, t, delta)
+    let f: F64 = model.log_density(logp, q_try)
+    if vec.is_finite(f) and f > f0 {
+      return LineStep { q: q_try, improved: true }
+    }
+    t = t * 0.5
+    tries = tries + 1
+  }
+  LineStep { q: q, improved: false }
+}
+
+# Fit the approximation: optimise to the mode, then build the Gaussian.
+#
+# Newton is the right optimiser here precisely because the Hessian is wanted
+# anyway. Every step recomputes it, converging quadratically near the mode, and
+# the last one built is the one the covariance is formed from. A model whose mode
+# the optimiser cannot reach, or whose Hessian there is not negative definite,
+# comes back with a message rather than a covariance full of nonsense.
+fn laplace_fit(logp: fn(Tensor) -> Tensor, init: Arr[F64], cfg: LaplaceConfig) -> LaplaceResult {
+  let q: Arr[F64] = vec.copy(init)
+  let d: I64 = len(q)
+  let converged: Bool = false
+  let it: I64 = 0
+  while it < cfg.max_iter and not converged {
+    let ld: model.LogDensity = model.value_and_gradient(logp, q)
+    if not vec.all_finite(ld.grad) {
+      return failed("laplace: the gradient is not finite during optimisation")
+    }
+    if vec.max_abs(ld.grad) < cfg.tol {
+      converged = true
+    } else {
+      let prec: linalg.Mat = neg_mat(hessian_at(logp, q))
+      let step: Arr[F64] = ascent_direction(prec, ld.grad)
+      let ls: LineStep = line_search(logp, q, step, ld.value)
+      if ls.improved {
+        q = ls.q
+      } else {
+        # No step increases the density: this is a mode to the precision the
+        # arithmetic allows, whatever the gradient norm says.
+        converged = true
+      }
+      it = it + 1
+    }
+  }
+
+  # The Gaussian at the mode. -H is the precision; its inverse is the covariance,
+  # and the Cholesky both factors it for sampling and is the test that it is
+  # positive definite, which it is exactly when the mode is a maximum.
+  let prec: linalg.Mat = neg_mat(hessian_at(logp, q))
+  let cov: linalg.Mat = linalg.inv(prec)
+  if not mat_finite(cov) {
+    return failed("laplace: the negative Hessian is singular at the mode; there is no covariance")
+  }
+  let chol: linalg.Mat = linalg.cholesky(cov)
+  if not mat_finite(chol) {
+    return failed("laplace: the covariance is not positive definite; the mode is not a maximum")
+  }
+
+  # log evidence = logp(mode) + (d/2) log 2pi + (1/2) log det cov, and
+  # (1/2) log det cov is the sum of the logs of the Cholesky diagonal.
+  let logdet_half: F64 = 0.0
+  let i: I64 = 0
+  while i < d {
+    logdet_half = logdet_half + log(linalg.get(chol, i, i))
+    i = i + 1
+  }
+  let log_ev: F64 = (model.log_density(logp, q) + ((f64_of_i64(d) / 2.0) * LOG_TWO_PI)) + logdet_half
+
+  LaplaceResult { mode: q, cov: cov, chol: chol, log_evidence: log_ev,
+                  iterations: it, converged: converged, err: "" }
+}
+
+# One draw from the fitted Gaussian: mode + chol * z with z standard normal.
+# Because chol is lower triangular, the product is the triangular sum below, and
+# it turns d independent standard normals into a draw with the right mean and the
+# full covariance, correlations included.
+fn laplace_sample(res: LaplaceResult, r: random.Rng) -> Arr[F64] {
+  let d: I64 = len(res.mode)
+  let z: Arr[F64] = vec.zeros(d)
+  let i: I64 = 0
+  while i < d {
+    z[i] = random.normal(r)
+    i = i + 1
+  }
+  let out: Arr[F64] = vec.copy(res.mode)
+  i = 0
+  while i < d {
+    let s: F64 = 0.0
+    let j: I64 = 0
+    while j <= i {
+      s = s + linalg.get(res.chol, i, j) * z[j]
+      j = j + 1
+    }
+    out[i] = out[i] + s
+    i = i + 1
+  }
+  out
+}
+
+# The marginal standard deviation of each coordinate: the square root of the
+# covariance diagonal. It is the one-number-per-parameter uncertainty a summary
+# table wants, and it deliberately drops the correlations the full covariance
+# carries, which is the right thing for a per-parameter interval and the wrong
+# thing for anything that reasons about two parameters at once.
+fn laplace_marginal_sd(res: LaplaceResult) -> Arr[F64] {
+  let d: I64 = len(res.mode)
+  let out: Arr[F64] = vec.zeros(d)
+  let i: I64 = 0
+  while i < d {
+    out[i] = f64_sqrt(linalg.get(res.cov, i, i))
+    i = i + 1
+  }
+  out
+}
