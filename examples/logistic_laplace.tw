@@ -52,6 +52,14 @@ fn predict_prob(w: Arr[F64], x: Arr[F64]) -> F64 {
   1.0 / (1.0 + f64_exp(0.0 - z))
 }
 
+# The predictive probability at a point, analytically, by the delta method. The
+# prediction sigmoid(x . w) is a scalar function of the weights, and its gradient
+# at the mode is all the delta method needs: no draws, one gradient. The closure
+# captures the point x and is differentiated by the same autodiff as the model.
+fn delta_at(res: laplace.LaplaceResult, x: Tensor) -> laplace.DeltaPredictive {
+  laplace.laplace_delta(fn(w: Tensor) -> Tensor { sigmoid(sum(w * x)) }, res)
+}
+
 # The predictive probability at a point, with its uncertainty, by pushing many
 # posterior weight draws through the model and summarising the spread. The mean
 # is the prediction; the standard deviation is how much the data left undecided.
@@ -106,8 +114,22 @@ let deep_one = predictive_at(res, r, [1.0, 1.5, 1.0], 4000)
 let boundary = predictive_at(res, r, [1.0, 0.0, 0.0], 4000)
 
 print("")
-print("predicted P(class one), mean plus or minus posterior standard deviation:")
+print("predicted P(class one) by sampling 4000 posterior weights, mean +- sd:")
 print("  deep in class zero  " + str(deep_zero.mean) + " +- " + str(deep_zero.sd))
 print("  deep in class one   " + str(deep_one.mean) + " +- " + str(deep_one.sd))
 print("  on the boundary     " + str(boundary.mean) + " +- " + str(boundary.sd))
 print("  the boundary point's wider band is the uncertainty a point estimate hides")
+
+# The same predictions by the delta method: one gradient each, no draws. The
+# standard deviation agrees with the sampled band; the mean is the plug-in
+# sigmoid(x . mode) rather than the average over the posterior, which the sampled
+# mean pulls slightly toward one half, so the two mean columns differ by that.
+let dpz = delta_at(res, [1.0, -1.5, -1.0])
+let dpo = delta_at(res, [1.0, 1.5, 1.0])
+let dpb = delta_at(res, [1.0, 0.0, 0.0])
+
+print("")
+print("the same predictions by the delta method, analytic, no sampling:")
+print("  deep in class zero  " + str(dpz.mean) + " +- " + str(dpz.sd))
+print("  deep in class one   " + str(dpo.mean) + " +- " + str(dpo.sd))
+print("  on the boundary     " + str(dpb.mean) + " +- " + str(dpb.sd))

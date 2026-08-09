@@ -271,3 +271,32 @@ fn laplace_marginal_sd(res: LaplaceResult) -> Arr[F64] {
   }
   out
 }
+
+struct DeltaPredictive {
+  mean: F64,
+  variance: F64,
+  sd: F64,
+}
+
+# The predictive mean and variance of a scalar function of the parameters, by
+# the delta method.
+#
+# For a quantity g(w) with the parameters distributed as the fitted Gaussian, the
+# first-order Taylor expansion at the mode gives g(w) ~ g(mode) + grad^T (w -
+# mode), so the mean is g(mode) and the variance is grad^T cov grad, with grad
+# the gradient of g at the mode. It is the analytic alternative to drawing
+# posterior samples and pushing each through g: exact when g is linear, a good
+# approximation when g is smooth and the posterior is not too wide, and a single
+# gradient rather than thousands of function evaluations either way.
+#
+# g is differentiated by the same automatic differentiation as the model, so any
+# g written in twill has its gradient for free; g must return a scalar.
+fn laplace_delta(g: fn(Tensor) -> Tensor, res: LaplaceResult) -> DeltaPredictive {
+  let mode_t: Tensor = vec.to_tensor(res.mode)
+  let mean: F64 = vec.scalar_of(g(mode_t))
+  let gr: Arr[F64] = vec.of_tensor(grad(g)(mode_t))
+  # variance = grad^T cov grad = grad . (cov grad).
+  let cov_gr: Arr[F64] = col_to_arr(linalg.matmul(res.cov, col_of(gr)))
+  let var: F64 = vec.dot(gr, cov_gr)
+  DeltaPredictive { mean: mean, variance: var, sd: f64_sqrt(var) }
+}

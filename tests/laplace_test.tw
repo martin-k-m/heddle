@@ -69,8 +69,33 @@ fn samples_average_to_the_mode() {
   t.near("mean of the second", sum1 / f64_of_i64(n), -1.0, 0.2)
 }
 
+# Linear predictions, whose delta-method variance is exact rather than a first
+# order approximation, so they can be checked against a number.
+fn sum_of_weights(w: Tensor) -> Tensor = sum(w * [1.0, 1.0])
+fn difference_of_weights(w: Tensor) -> Tensor = sum(w * [1.0, -1.0])
+
+fn the_delta_method_is_exact_for_a_linear_prediction() {
+  let res = laplace.laplace_fit(a_diagonal_normal, [0.0, 0.0], laplace.default_config())
+  # g = w0 + w1, gradient [1, 1], so the variance is 0.25 + 9 = 9.25 on the
+  # diagonal covariance, and the mean is the sum of the modes, 2 + (-1) = 1.
+  let dp = laplace.laplace_delta(sum_of_weights, res)
+  t.near("delta mean", dp.mean, 1.0, 0.0001)
+  t.near("delta variance", dp.variance, 9.25, 0.001)
+}
+
+fn the_delta_method_uses_the_off_diagonal_covariance() {
+  let res = laplace.laplace_fit(a_correlated_normal, [1.0, 1.0], laplace.default_config())
+  # g = w0 - w1 on covariance [[1, 0.95], [0.95, 1]]: the variance is
+  # 1 - 0.95 - 0.95 + 1 = 0.1, which the correlation shrinks and a view of the
+  # marginals alone would report as 2.
+  let dp = laplace.laplace_delta(difference_of_weights, res)
+  t.near("delta variance of the difference", dp.variance, 0.1, 0.002)
+}
+
 laplace_recovers_the_mode_and_the_marginal_deviations()
 laplace_recovers_the_full_covariance_including_correlation()
 the_log_evidence_of_a_normalised_gaussian_is_zero()
 samples_average_to_the_mode()
+the_delta_method_is_exact_for_a_linear_prediction()
+the_delta_method_uses_the_off_diagonal_covariance()
 t.report("laplace")
