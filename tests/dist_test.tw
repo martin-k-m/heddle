@@ -227,7 +227,7 @@ fn the_multivariate_normal_gradient_flows_into_the_cholesky_factor() {
   # std/linalg: the factor is a parameter and its gradient is what moves it.
   let h: F64 = 0.00001
   let f = fn(a: Tensor) -> Tensor {
-    let l: Tensor = concat_tensors([reshape(concat_tensors([a, reshape(scalar(0.0), 1)], 0), 1, 2),
+    let l: Tensor = concat([reshape(concat([a, reshape(scalar(0.0), 1)], 0), 1, 2),
                                     reshape([0.4, 1.2], 1, 2)], 0)
     dist.mvnormal_log_prob([1.0, -0.5], [0.0, 0.0], l, 2)
   }

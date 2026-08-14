@@ -127,13 +127,13 @@ fn the_stick_breaking_jacobian_includes_the_remaining_stick() {
     let minus: Arr[F64] = [x[0], x[1], x[2]]
     plus[k] = plus[k] + H
     minus[k] = minus[k] - H
-    let dy: F64 = item(tr.simplex(tensor_of_arr(plus), 4).y[k])
-      - item(tr.simplex(tensor_of_arr(minus), 4).y[k])
+    let dy: F64 = item(tr.simplex(tensor(plus), 4).y[k])
+      - item(tr.simplex(tensor(minus), 4).y[k])
     product = product * (dy / (2.0 * H))
     k = k + 1
   }
 
-  let claimed: F64 = f64_exp(item(tr.simplex(tensor_of_arr(x), 4).log_jac))
+  let claimed: F64 = f64_exp(item(tr.simplex(tensor(x), 4).log_jac))
   t.near("stick breaking log determinant", claimed, product, 0.000001)
 }
 

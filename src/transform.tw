@@ -244,7 +244,7 @@ fn simplex(x: Tensor, k: I64) -> Simplex {
   # K-1 unconstrained coordinates.
   push(pieces, reshape(remaining, 1))
 
-  Simplex { y: concat_tensors(pieces, 0), log_jac: lj }
+  Simplex { y: concat(pieces, 0), log_jac: lj }
 }
 
 # The inverse, for placing an initial point or reporting a constrained draw.
@@ -265,7 +265,7 @@ fn simplex_inverse(y: Tensor, k: I64) -> Tensor {
     i = i + 1
   }
 
-  concat_tensors(pieces, 0)
+  concat(pieces, 0)
 }
 
 # ---- ordered vectors --------------------------------------------------------
@@ -300,7 +300,7 @@ fn ordered(x: Tensor, n: I64) -> Ordered {
     i = i + 1
   }
 
-  Ordered { y: concat_tensors(pieces, 0), log_jac: lj }
+  Ordered { y: concat(pieces, 0), log_jac: lj }
 }
 
 fn ordered_inverse(y: Tensor, n: I64) -> Tensor {
@@ -311,7 +311,7 @@ fn ordered_inverse(y: Tensor, n: I64) -> Tensor {
     push(pieces, reshape(log(y[i] - y[i - 1]), 1))
     i = i + 1
   }
-  concat_tensors(pieces, 0)
+  concat(pieces, 0)
 }
 
 # ---- a Cholesky factor with a positive diagonal -----------------------------
@@ -358,11 +358,11 @@ fn chol_factor(x: Tensor, n: I64) -> CholFactor {
       }
       j = j + 1
     }
-    push(rows, reshape(concat_tensors(cells, 0), 1, n))
+    push(rows, reshape(concat(cells, 0), 1, n))
     i = i + 1
   }
 
-  CholFactor { l: concat_tensors(rows, 0), log_jac: sum(x[0:n]) }
+  CholFactor { l: concat(rows, 0), log_jac: sum(x[0:n]) }
 }
 
 # The number of unconstrained coordinates a Cholesky factor of dimension n

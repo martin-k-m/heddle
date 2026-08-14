@@ -206,7 +206,7 @@ fn is_finite(x: F64) -> Bool {
 # pass for every distribution by hand, which is precisely the work `grad`
 # exists to remove and precisely the work a probabilistic programming library
 # should not be reintroducing.
-fn to_tensor(xs: Arr[F64]) -> Tensor = tensor_of_arr(xs)
+fn to_tensor(xs: Arr[F64]) -> Tensor = tensor(xs)
 
 fn of_tensor(t: Tensor) -> Arr[F64] = arr_of_tensor(t)
 
