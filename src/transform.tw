@@ -160,8 +160,17 @@ fn unit_log_jac(x: Tensor) -> Tensor =
 # is a real log density rather than one up to a constant, and the marginal
 # likelihood estimates in `src/advi.tw` depend on that.
 
+# The clip is not decoration. `sigmoid(x)` reaches exactly 1.0 in f64 somewhere
+# around x = 37, so a + (b - a) * sigmoid(x) returns exactly `b` for any larger
+# x, and a constrained parameter lands *on* its bound. Everything downstream
+# then divides by zero: `interval_inverse` takes log(1 - z) and a sampler that
+# proposes a large x gets an infinite log density rather than a rejected step.
+# Clipping to one ulp inside keeps the map strictly interior, which is what the
+# transform exists to guarantee.
+let INTERIOR: F64 = 0.0000000000000002220446049250313
+
 fn interval_forward(x: Tensor, a: F64, b: F64) -> Tensor =
-  a + (b - a) * sigmoid(x)
+  a + (b - a) * clip(sigmoid(x), INTERIOR, 1.0 - INTERIOR)
 
 fn interval_inverse(y: Tensor, a: F64, b: F64) -> Tensor {
   let z: Tensor = (y - a) / (b - a)

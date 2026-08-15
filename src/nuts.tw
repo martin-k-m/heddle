@@ -528,7 +528,7 @@ fn run_chain(logp: fn(Tensor) -> Tensor, q_init: Arr[F64], cfg: NutsConfig) -> c
     if not vec.is_finite(h) {
       return -1.0e10
     }
-    f64_min(0.0, h - h_probe)
+    item(minimum(scalar(0.0), scalar(h - h_probe)))
   })
 
   let da = adapt.dual_avg(eps, cfg.target_accept)
