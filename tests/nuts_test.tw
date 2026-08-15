@@ -61,9 +61,17 @@ fn a_perpendicular_momentum_is_not_yet_a_turn() {
 # forms agree, which is why an implementation missing it passes every test on a
 # standard normal. Here the metric is what decides the answer.
 fn the_metric_decides_the_criterion_when_the_scales_differ() {
-  let p_minus: Arr[F64] = [1.0, -3.0]
+  # The second coordinate is the one the metric stretches, and it carries a
+  # small backward component: negligible against the first coordinate under an
+  # identity metric, dominant once the metric scales it by a hundred.
+  #
+  # These numbers used to be [1, -3], [1, 1] and rho [0.5, 2], which do not show
+  # the contrast the test is named for: the backward component was large enough
+  # that dot(p_minus, rho) is -5.5 under the identity metric too, so both halves
+  # were turns and the identity case could never have held.
+  let p_minus: Arr[F64] = [1.0, -0.1]
   let p_plus: Arr[F64] = [1.0, 1.0]
-  let rho: Arr[F64] = [0.5, 2.0]
+  let rho: Arr[F64] = [1.0, 2.0]
 
   let identity: Arr[F64] = [1.0, 1.0]
   let stretched: Arr[F64] = [1.0, 100.0]
@@ -114,12 +122,26 @@ fn nuts_and_random_walk_metropolis_agree_on_a_correlated_gaussian() {
   let r_cfg = rwm.rwm_config(3000, 40000, 12)
   let rc = rwm.run_chain(correlated, [0.0, 0.0], r_cfg)
 
+  # The tolerances are fractions of the coordinate's own standard deviation, not
+  # fixed distances, because the two marginals of this target differ in scale by
+  # a factor of ten -- which is the whole reason it was chosen.
+  #
+  # A fixed 0.25 was demanding that two independent estimates of a mean whose
+  # Monte Carlo standard error is about 0.45 agree to within half of one
+  # standard error, which two correct samplers fail more often than not. It went
+  # unnoticed because std/random used to return a constant: both chains then sat
+  # at the same point and agreed exactly, so this tolerance had never once been
+  # exercised against real draws.
+  #
+  # A quarter of a standard deviation is about five standard errors on both
+  # coordinates, and it is the size of bias the comment above is describing.
   let k: I64 = 0
   while k < 2 {
     let a: Arr[F64] = chain.column(nc, k)
     let b: Arr[F64] = chain.column(rc, k)
-    t.near("coordinate " + str(k) + " mean agrees", diag.mean_of(a), diag.mean_of(b), 0.25)
-    t.near("coordinate " + str(k) + " sd agrees", diag.sd_of(a), diag.sd_of(b), 0.6)
+    let scale: F64 = diag.sd_of(b)
+    t.near("coordinate " + str(k) + " mean agrees", diag.mean_of(a), diag.mean_of(b), 0.25 * scale)
+    t.near("coordinate " + str(k) + " sd agrees", diag.sd_of(a), diag.sd_of(b), 0.15 * scale)
     k = k + 1
   }
 }

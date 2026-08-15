@@ -86,6 +86,18 @@ struct AdviConfig {
   # gradient noise per step at proportional cost, and is worth it for a model
   # whose log density is cheap relative to the optimiser overhead.
   mc_samples: I64,
+  # The step scale. ADVI's own paper does not fix this: it tries a grid of
+  # {100, 10, 1, 0.1, 0.01} on a short run and keeps whichever gives the best
+  # ELBO, because the right value depends on the target and on how far the
+  # initialisation sits from the mode. heddle does not adapt it yet, so the
+  # default has to be a value that can travel.
+  #
+  # It was 0.1, which cannot. The step decays as n^-1/2, so the total distance
+  # the fit can cover is about 2 * eta * sqrt(iterations): at 0.1 over three
+  # thousand iterations that is eleven units of parameter space before the
+  # optimiser grinds to a halt, and it was reaching about a third of that in
+  # practice. Fitting a Normal(2, 0.5) from an initialisation at 10 -- sixteen
+  # standard deviations out, but only eight units -- did not finish.
   eta: F64,
   # The window over which convergence is judged, and the relative change below
   # which it is declared.
@@ -98,7 +110,7 @@ fn advi_config(iterations: I64, seed: I64) -> AdviConfig =
   AdviConfig {
     iterations: iterations,
     mc_samples: 1,
-    eta: 0.1,
+    eta: 1.0,
     window: 50,
     tol: 0.01,
     seed: seed,
@@ -156,6 +168,13 @@ fn advi_fit(logp: fn(Tensor) -> Tensor, init: Arr[F64], cfg: AdviConfig) -> Advi
   let history: Arr[F64] = []
   let converged: Bool = false
   let done_at: I64 = cfg.iterations
+  # Where mu stood at the start of the current window, for the convergence test.
+  let mu_mark: Arr[F64] = vec.zeros(d)
+  let mm: I64 = 0
+  while mm < d {
+    mu_mark[mm] = mu[mm]
+    mm = mm + 1
+  }
 
   let n: I64 = 0
   while n < cfg.iterations and not converged {
@@ -219,25 +238,43 @@ fn advi_fit(logp: fn(Tensor) -> Tensor, init: Arr[F64], cfg: AdviConfig) -> Advi
       }
     }
 
-    # Convergence on the relative change of the ELBO, averaged over a window.
-    # A single-iteration change is dominated by the Monte Carlo noise in the
-    # estimate and would declare convergence at the first lucky draw.
-    if len(history) >= 2 * cfg.window {
-      let recent: F64 = window_mean(history, len(history) - cfg.window, cfg.window)
-      let earlier: F64 = window_mean(history, len(history) - 2 * cfg.window, cfg.window)
-      let denom: F64 = earlier
-      if denom < 0.0 {
-        denom = 0.0 - denom
+    # Convergence on the variational parameters, not on the ELBO.
+    #
+    # Two things were wrong with judging it by the ELBO. Its level is arbitrary
+    # -- a log density carries an additive constant, which is the whole premise
+    # of sampling an unnormalised target -- so a change measured as a fraction
+    # of it means nothing and moves if the target is shifted by a constant. And
+    # the step size decays as n^-1/2 by construction, so the ELBO's improvement
+    # per window shrinks whether or not the optimum was reached: the test was
+    # measuring the schedule rather than the fit. It stopped this one after 471
+    # iterations at mu = [5.6, 7.7] when the answer was [2, -1] and 3000
+    # iterations were allowed. Running it with the test disabled reached 1.9994.
+    #
+    # What a caller takes out of a fit is mu, so mu is what has to have stopped
+    # moving, measured in units of the posterior width the fit itself found. A
+    # move of less than `tol` of a standard deviation over a whole window is a
+    # fit that has settled, on any target and at any offset.
+    if n > 0 and n % cfg.window == 0 {
+      let moved: F64 = 0.0
+      let i: I64 = 0
+      while i < d {
+        let scale: F64 = f64_exp(omega[i])
+        let delta: F64 = (mu[i] - mu_mark[i]) / scale
+        if delta < 0.0 {
+          moved = f64_max_of(moved, 0.0 - delta)
+        } else {
+          moved = f64_max_of(moved, delta)
+        }
+        i = i + 1
       }
-      if denom > 0.0 {
-        let rel: F64 = (recent - earlier) / denom
-        if rel < 0.0 {
-          rel = 0.0 - rel
-        }
-        if rel < cfg.tol {
-          converged = true
-          done_at = n + 1
-        }
+      if moved < cfg.tol {
+        converged = true
+        done_at = n + 1
+      }
+      let j: I64 = 0
+      while j < d {
+        mu_mark[j] = mu[j]
+        j = j + 1
       }
     }
 
@@ -245,6 +282,11 @@ fn advi_fit(logp: fn(Tensor) -> Tensor, init: Arr[F64], cfg: AdviConfig) -> Advi
   }
 
   AdviResult { mu: mu, omega: omega, elbo: history, iterations: done_at, converged: converged }
+}
+
+fn f64_max_of(a: F64, b: F64) -> F64 {
+  if a > b { return a }
+  b
 }
 
 fn window_mean(xs: Arr[F64], start: I64, count: I64) -> F64 {
