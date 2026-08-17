@@ -1,11 +1,11 @@
 <p align="center">
-  <img alt="twill" src="https://raw.githubusercontent.com/martin-k-m/twill/main/assets/twill-mark.png" width="120">
+  <img alt="twill" src="https://raw.githubusercontent.com/twill-lang/twill/main/assets/twill-mark.png" width="120">
 </p>
 
 <h1 align="center">heddle</h1>
 
 <p align="center">
-  <b>Probabilistic programming and Bayesian inference for <a href="https://github.com/martin-k-m/twill">twill</a>.</b><br>
+  <b>Probabilistic programming and Bayesian inference for <a href="https://github.com/twill-lang/twill">twill</a>.</b><br>
   Written in twill.
 </p>
 
@@ -383,7 +383,7 @@ docs/needs.md       what the language still has to provide
 Once spool and `mode systems` both work:
 
 ```
-spool add heddle https://github.com/martin-k-m/heddle
+spool add heddle https://github.com/twill-lang/heddle
 ```
 
 spool vendors into `twill_modules/`, and twill's import is a path, so the import
