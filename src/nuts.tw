@@ -113,12 +113,53 @@ fn is_u_turn(sharp_minus: Arr[F64], sharp_plus: Arr[F64], rho: Arr[F64]) -> Bool
 #   log_weight     logsumexp over the sub-tree of (-H), the total weight this
 #                  sub-tree carries into the merge
 #   rho            the summed momentum, for the U-turn criterion
-#   ok             false when this sub-tree contains a divergence or an
-#                  internal U-turn. A false here invalidates the entire
-#                  doubling, not just this sub-tree
+#   outcome        whether this sub-tree can be built on. Anything but `Valid`
+#                  invalidates the entire doubling, not just this sub-tree
 #   accept_sum,
 #   n_leapfrog     the acceptance statistic accumulated over every state, for
 #                  dual averaging
+
+# How a sub-tree ended, which is three things and not two.
+#
+# This was a pair of Bools, `ok` and `divergent`, and "not ok, not divergent"
+# meant a U-turn by convention rather than by construction. The pair also had a
+# fourth combination that no code could produce and every reader had to rule out
+# for themselves. Nothing forced a reader of `merge` to handle the third case,
+# and `merge` is the function where a missed case is a biased posterior.
+#
+# The two are not interchangeable at the caller either: a divergence is counted
+# and reported to the user as a diagnostic about their model, while a U-turn is
+# the sampler working correctly and stopping when it should.
+enum Outcome {
+  Valid,
+  Turned,
+  Diverged,
+}
+
+# Whether a sub-tree with this outcome can be extended. Written once, here,
+# rather than as `not ok` at each of the eight places that asked.
+fn can_extend(o: Outcome) -> Bool {
+  match o {
+    Valid => true,
+    Turned => false,
+    Diverged => false,
+  }
+}
+
+# The outcome of a merged trajectory, before its own U-turn checks run. A
+# divergence anywhere is the strongest and survives; a turn in either half
+# stops the doubling too.
+fn combine(a: Outcome, b: Outcome) -> Outcome {
+  match a {
+    Diverged => Diverged,
+    Turned => match b {
+      Diverged => Diverged,
+      Turned => Turned,
+      Valid => Turned,
+    },
+    Valid => b,
+  }
+}
 
 struct Subtree {
   q_minus: Arr[F64],
@@ -131,8 +172,7 @@ struct Subtree {
   logp_prop: F64,
   log_weight: F64,
   rho: Arr[F64],
-  ok: Bool,
-  divergent: Bool,
+  outcome: Outcome,
   accept_sum: F64,
   n_leapfrog: I64,
 }
@@ -183,7 +223,7 @@ fn build_tree(logp: fn(Tensor) -> Tensor, r: random.Rng, start: hmc.Point,
   # second half and then discarding it would be correct and would waste half
   # the gradient evaluations of the deepest doubling, which is most of the cost
   # of a divergent draw.
-  if not first.ok {
+  if not can_extend(first.outcome) {
     return first
   }
 
@@ -200,6 +240,20 @@ fn build_tree(logp: fn(Tensor) -> Tensor, r: random.Rng, start: hmc.Point,
                                    inv_mass, max_depth)
 
   merge(r, first, second, direction, inv_mass, false)
+}
+
+# An invalid half is discarded entirely and the trajectory stops.
+#
+# This is the property named at the top of the file. It is tempting to keep the
+# valid prefix of the failed half, and it is wrong: whether a state was reached
+# before or after the failure depends on the direction the doubling happened to
+# take, so keeping the prefix makes the selection depend on the random direction
+# and the sampler no longer targets the posterior. The statistic is still
+# accumulated from those states, because dual averaging is not a sampling
+# decision.
+fn discard_half(tree: Subtree, added: Subtree) {
+  tree.accept_sum = tree.accept_sum + added.accept_sum
+  tree.n_leapfrog = tree.n_leapfrog + added.n_leapfrog
 }
 
 # The base case: one leapfrog step, one state.
@@ -238,8 +292,7 @@ fn build_leaf(logp: fn(Tensor) -> Tensor, start: hmc.Point, direction: F64,
     q_prop: pt.q, logp_prop: pt.logp,
     log_weight: weight,
     rho: vec.copy(pt.p),
-    ok: not divergent,
-    divergent: divergent,
+    outcome: if divergent { Diverged } else { Valid },
     accept_sum: a,
     n_leapfrog: 1,
   }
@@ -276,8 +329,7 @@ fn merge(r: random.Rng, first: Subtree, second: Subtree, direction: F64,
     q_prop: first.q_prop, logp_prop: first.logp_prop,
     log_weight: log_add(first.log_weight, second.log_weight),
     rho: vec.add(first.rho, second.rho),
-    ok: first.ok and second.ok,
-    divergent: first.divergent or second.divergent,
+    outcome: combine(first.outcome, second.outcome),
     accept_sum: first.accept_sum + second.accept_sum,
     n_leapfrog: first.n_leapfrog + second.n_leapfrog,
   }
@@ -304,7 +356,7 @@ fn merge(r: random.Rng, first: Subtree, second: Subtree, direction: F64,
   # The multinomial draw. Only from a valid second half: a sub-tree that
   # diverged or turned contributes no candidate, because the states past the
   # failure are not part of a valid trajectory.
-  if second.ok {
+  if can_extend(second.outcome) {
     let take: F64 = 0.0
     if top_level {
       # min(1, exp(w2 - w1)), the biased progressive rule.
@@ -324,11 +376,11 @@ fn merge(r: random.Rng, first: Subtree, second: Subtree, direction: F64,
   # ---- the U-turn checks -------------------------------------------------
   #
   # The main check, across the merged sub-trajectory's own ends.
-  if out.ok {
+  if can_extend(out.outcome) {
     let sharp_minus: Arr[F64] = p_sharp(out.p_minus, inv_mass)
     let sharp_plus: Arr[F64] = p_sharp(out.p_plus, inv_mass)
     if is_u_turn(sharp_minus, sharp_plus, out.rho) {
-      out.ok = false
+      out.outcome = Turned
     }
   }
 
@@ -350,7 +402,7 @@ fn merge(r: random.Rng, first: Subtree, second: Subtree, direction: F64,
   # evaluations to travel out and back. It is a performance bug that reads as
   # a correctness one, because the wasted work shows up as a low effective
   # sample size that gets blamed on the model.
-  if out.ok {
+  if can_extend(out.outcome) {
     let rho_a: Arr[F64] = vec.add(first.rho, second.p_minus)
     let sa_minus: Arr[F64] = p_sharp(first.p_minus, inv_mass)
     let sa_plus: Arr[F64] = p_sharp(second.p_minus, inv_mass)
@@ -360,11 +412,11 @@ fn merge(r: random.Rng, first: Subtree, second: Subtree, direction: F64,
       sa_plus = p_sharp(first.p_plus, inv_mass)
     }
     if is_u_turn(sa_minus, sa_plus, rho_a) {
-      out.ok = false
+      out.outcome = Turned
     }
   }
 
-  if out.ok {
+  if can_extend(out.outcome) {
     let rho_b: Arr[F64] = vec.add(first.p_plus, second.rho)
     let sb_minus: Arr[F64] = p_sharp(first.p_plus, inv_mass)
     let sb_plus: Arr[F64] = p_sharp(second.p_plus, inv_mass)
@@ -374,7 +426,7 @@ fn merge(r: random.Rng, first: Subtree, second: Subtree, direction: F64,
       sb_plus = p_sharp(first.p_minus, inv_mass)
     }
     if is_u_turn(sb_minus, sb_plus, rho_b) {
-      out.ok = false
+      out.outcome = Turned
     }
   }
 
@@ -413,8 +465,7 @@ fn nuts_draw(logp: fn(Tensor) -> Tensor, r: random.Rng, q: Arr[F64], eps: F64,
     q_prop: vec.copy(start.q), logp_prop: start.logp,
     log_weight: h0,
     rho: vec.copy(start.p),
-    ok: true,
-    divergent: false,
+    outcome: Valid,
     accept_sum: 0.0,
     n_leapfrog: 0,
   }
@@ -443,32 +494,28 @@ fn nuts_draw(logp: fn(Tensor) -> Tensor, r: random.Rng, q: Arr[F64], eps: F64,
     let added: Subtree = build_tree(logp, r, edge, direction, depth, eps, h0,
                                     inv_mass, max_depth)
 
-    if added.divergent {
-      divergent = true
-    }
-
-    if not added.ok {
-      # The new half is invalid. Its states are discarded entirely and the
-      # trajectory stops here.
-      #
-      # This is the property named at the top of the file. It is tempting to
-      # keep the valid prefix of the failed half, and it is wrong: whether a
-      # state was reached before or after the failure depends on the direction
-      # the doubling happened to take, so keeping the prefix makes the
-      # selection depend on the random direction and the sampler no longer
-      # targets the posterior. The statistic is still accumulated from those
-      # states, because dual averaging is not a sampling decision.
-      tree.accept_sum = tree.accept_sum + added.accept_sum
-      tree.n_leapfrog = tree.n_leapfrog + added.n_leapfrog
-      running = false
-    } else {
-      tree = merge(r, tree, added, direction, inv_mass, true)
-      depth = depth + 1
-      if not tree.ok {
-        # The merged trajectory has turned. The doubling itself was valid, so
-        # its state stands as the draw; only further doubling stops.
+    # The three outcomes are three different things to do, which is the whole
+    # reason this is an enum: a divergence is also counted and reported, and a
+    # turn is not.
+    match added.outcome {
+      Diverged => {
+        divergent = true
+        discard_half(tree, added)
         running = false
-      }
+      },
+      Turned => {
+        discard_half(tree, added)
+        running = false
+      },
+      Valid => {
+        tree = merge(r, tree, added, direction, inv_mass, true)
+        depth = depth + 1
+        if not can_extend(tree.outcome) {
+          # The merged trajectory has turned. The doubling itself was valid, so
+          # its state stands as the draw; only further doubling stops.
+          running = false
+        }
+      },
     }
   }
 
