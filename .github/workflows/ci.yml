@@ -156,3 +156,9 @@ jobs:
 
       - name: Run the tests
         run: ./twill test tests
+
+      # No example-run step. heddle's examples are NUTS runs, and its own
+      # docs/needs.md says a NUTS run takes "minutes to hours" -- the tests job
+      # above is already the slowest in the ecosystem for the same reason.
+      # They are checked, not run, and that is a cost decision rather than an
+      # oversight.
