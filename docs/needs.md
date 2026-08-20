@@ -267,9 +267,20 @@ which is worse than having no CI.
 return a value and its Jacobian together), `src/hmc.tw` (`DrawResult`),
 `src/nuts.tw` (`Subtree`), `src/advi.tw` (`AdviResult`), `src/model.tw`
 (`LogDensity`)
-**Status:** `Res[T, E]` and `Opt[T]` are in section 1.2 of the self-hosting
-design and need generics. Duplicates twill NEEDS-10 and NEEDS-4, and loom's
-entry 4 and weft's entry 13.
+**Status:** the language half is done -- `Res[T, E]` and `Opt[T]` are checked
+types (twill 1.6) and twill 1.7 closed NEEDS-4, so a declaration here can take
+type parameters too. The adoption is heddle's and has not been done.
+
+**One correction, because this entry asked for the wrong thing.** It says the
+two-value returns need generics. Three of the four do not: `Simplex`, `Ordered`
+and `CholFactor` are the same *concrete* struct three times -- two `Tensor`
+fields, a value and its log Jacobian -- so what removes them is one shared
+struct, or the tuple this entry also asks for, and a type parameter would be
+ceremony over a type that never varies. `LogDensity` is the one that differs
+(`F64` and `Arr[F64]`), and unifying it with the others would take two
+parameters to say something no reader wanted said. Generics arriving therefore
+does not resolve this entry; multiple return values still would. Duplicates
+twill NEEDS-10, and loom's entry 4 and weft's entry 13.
 
 Two separate complaints in one entry, because they have one fix.
 
@@ -288,8 +299,12 @@ wanted; they are tuples with names. `LogDensity` is the fourth.
 **Used by:** would be used by `src/nuts.tw` (`Subtree.ok` and
 `Subtree.divergent` are a two-bit encoding of a three-case outcome: valid,
 turned, diverged), `src/dist.tw` (the family of distributions)
-**Status:** designed in section 1.2, not implemented. Duplicates twill NEEDS-3
-and loom's entry 5.
+**Status:** the language half has been done since twill 1.6, and this status
+line was stale for two releases: `enum` with payloads, `match`, and enforced
+exhaustiveness all exist, and twill 1.7 added nested patterns, literal patterns
+and guards on top. So nothing is blocking, and the two-Bool `Subtree` encoding
+below is now heddle's own to fix rather than something it is waiting on.
+Duplicates twill NEEDS-3 and loom's entry 5.
 
 `Subtree` carries two Bools where one enum with three cases would do, and the
 combination "not ok, not divergent" means "turned" by convention rather than by
