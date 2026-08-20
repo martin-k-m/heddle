@@ -299,12 +299,20 @@ wanted; they are tuples with names. `LogDensity` is the fourth.
 **Used by:** would be used by `src/nuts.tw` (`Subtree.ok` and
 `Subtree.divergent` are a two-bit encoding of a three-case outcome: valid,
 turned, diverged), `src/dist.tw` (the family of distributions)
-**Status:** the language half has been done since twill 1.6, and this status
-line was stale for two releases: `enum` with payloads, `match`, and enforced
-exhaustiveness all exist, and twill 1.7 added nested patterns, literal patterns
-and guards on top. So nothing is blocking, and the two-Bool `Subtree` encoding
-below is now heddle's own to fix rather than something it is waiting on.
-Duplicates twill NEEDS-3 and loom's entry 5.
+**Status:** done, and the paragraph below it describes code that no longer
+exists. The language half landed in twill 1.6 -- `enum` with payloads, `match`
+and enforced exhaustiveness -- with nested patterns, literal patterns and guards
+added in 1.7. heddle adopted it at the same time: `src/nuts.tw` declares
+`enum Outcome { Valid, Turned, Diverged }` and `Subtree.outcome` is one of them,
+so the two Bools and the "not ok, not divergent means turned" convention are
+gone, and `can_extend` is the single place that decides. `src/dist.tw` turned
+out not to want an enum at all: it is a flat set of `<family>_log_prob`,
+`_sample` and `_reparam` functions with no tag to dispatch on, and every caller
+names the family statically. Duplicates twill NEEDS-3 and loom's entry 5.
+
+*Previously, and now describing nothing:* "`Subtree` carries two Bools where one
+enum with three cases would do, and the combination \"not ok, not divergent\"
+means \"turned\" by convention rather than by construction."
 
 `Subtree` carries two Bools where one enum with three cases would do, and the
 combination "not ok, not divergent" means "turned" by convention rather than by
