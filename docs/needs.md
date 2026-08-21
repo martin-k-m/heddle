@@ -1,9 +1,23 @@
 # What heddle needs from twill
 
-heddle is written in twill and does not run yet. This file is the reason: the
-language and runtime features the source uses that twill does not provide today,
-with the file and function that needs each one, and what heddle does in the
-meantime.
+heddle is written in twill and it runs. `twill test tests` passes all 8 suites
+under twill 1.7.1. This file started as the reason it did not: the language and
+runtime features the source uses that twill did not provide, with the file and
+function that needs each one, and what heddle did in the meantime.
+
+Most of it is now history. Entries 1 to 18 and 21 are delivered, and the proof
+is that the suites pass rather than an announcement in a changelog: every one of
+those features is on the path a passing test takes. Entry 20 was delivered and
+adopted. Entry 24 was delivered by `twill test`, and heddle's CI uses it. Entry
+4 was delivered and heddle has chosen not to use it, which is a different thing
+and is said as such below. What is still open is entries 19, 22, 23, 25, 26 and
+27, and they are the useful part of this file today.
+
+Each delivered entry keeps its original text, because the argument it made is
+what got it built and the wording of the ask is worth preserving. The
+**Delivered** line at the head of each says what arrived and where heddle uses
+it. Where an entry's own **Status:** line contradicts the Delivered line, the
+Delivered line is the current one.
 
 It is a work queue for the language, not a complaint. Every entry was reached by
 writing real code and hitting the wall, which is the only way a list like this is
@@ -20,9 +34,12 @@ give the NEEDS number. Those are not new work; they are evidence that a second
 independent package hit the same wall, which is the only argument for priority
 this list can make.
 
-## Blocking: heddle cannot run at all without these
+## Delivered: heddle could not run at all without these, and now it does
 
 ### 1. `mode systems` itself
+
+**Delivered.** twill 1.6. Every `.tw` file in this repository begins `mode
+systems` and CI gates on it.
 
 **Used by:** every file
 **Status:** designed in `docs/self-hosting.md`, not implemented. Duplicates twill
@@ -31,6 +48,12 @@ NEEDS-1.
 Nothing else on this list matters until this does.
 
 ### 2. Tensors, `grad`, `grads` and `value_and_grad` inside a systems-mode file
+
+**Delivered.** `Tensor` is a legal annotation in systems mode and the
+differentiation builtins are callable there. `src/model.tw`'s
+`value_and_gradient` is the seam, and `tests/model_test.tw`'s
+`the_value_and_gradient_of_a_model_are_both_right` is the check. This is the
+entry heddle existed to file.
 
 **Needs:** `Tensor` as a type name in an annotation, and the differentiation
 builtins callable from systems mode
@@ -58,6 +81,12 @@ same seam seen from two sides.
 
 ### 3. Function values as parameters, and a function type in an annotation
 
+**Delivered.** `fn(Tensor) -> Tensor` is a parameter type and a function value
+is passed into a systems-mode function. `src/nuts.tw`, `src/hmc.tw`,
+`src/rwm.tw`, `src/advi.tw` and `src/laplace.tw` all take the model this way.
+Closures capturing the environment work too, which `src/adapt.tw`'s
+`initial_step_search` needs.
+
 **Needs:** `fn(Tensor) -> Tensor` as a parameter type, and a function value
 passed into a systems-mode function
 **Used by:** `src/nuts.tw` (`nuts_draw`, `run_chain`, `build_tree`),
@@ -78,6 +107,13 @@ requirement is a real closure and not a top-level function pointer.
 
 ### 4. Function values in struct fields
 
+**Delivered.** twill takes a function as a struct field type. I checked under
+twill 1.7.1 by declaring `struct Dist { name: Str, log_prob: fn(F64) -> F64 }`,
+building one and calling through the field; it runs. heddle still has no such
+struct, and that is now a decision rather than a limit, for the reason this
+entry already gives: nothing here dispatches over a distribution at runtime.
+`README.md` said this was blocked; that has been corrected.
+
 **Needs:** a struct field whose type is a function
 **Used by:** would be used by a `Distribution` struct in `src/dist.tw`, and by a
 `Target` struct in `src/model.tw`
@@ -95,6 +131,9 @@ the distribution at the call site. Recorded so that the absence reads as a
 decision rather than an omission.
 
 ### 5. `tensor_of_arr(Arr[F64]) -> Tensor`
+
+**Delivered.** Spelled `tensor(xs)`, which accepts a systems-mode `Arr[F64]`.
+`src/vec.tw`'s `to_tensor` is one line because of it.
 
 **Needs:** a rank-1 tensor built from a systems-mode `Arr[F64]`
 **Used by:** `src/vec.tw` (`to_tensor`), and therefore every gradient evaluation
@@ -114,6 +153,10 @@ argues this at length.
 
 ### 6. `arr_of_tensor(Tensor) -> Arr[F64]` and `item` into an `F64`
 
+**Delivered.** Both. `arr_of_tensor` is a builtin and `item` yields a
+systems-mode `F64`. `src/vec.tw`'s `of_tensor` and `scalar_of` are one line
+each.
+
 **Needs:** the other direction of entry 5, and a rank-0 tensor as a systems-mode
 `F64`
 **Used by:** `src/vec.tw` (`of_tensor`, `scalar_of`)
@@ -125,6 +168,12 @@ number and unwrapping it through a one-element array would be a lie about the
 shape. Both are needed.
 
 ### 7. `concat_tensors(Arr[Tensor], axis) -> Tensor`
+
+**Delivered.** `concat(pieces, axis)` takes a systems-mode `Arr[Tensor]` and
+the result stays on the tape. `src/transform.tw` uses it in `simplex`,
+`ordered` and `chol_factor`, and `tests/transform_test.tw` checks each of their
+Jacobians against a numerical determinant, which only passes if the gradient
+survived the concat.
 
 **Needs:** `concat` over a systems-mode `Arr[Tensor]`
 **Used by:** `src/transform.tw` (`simplex`, `simplex_inverse`, `ordered`,
@@ -143,6 +192,10 @@ than nothing, because it would be silent.
 
 ### 8. `continue` in a `while` loop
 
+**Delivered.** twill has `continue`. `src/dist.tw` uses it at three sites,
+including the `v <= 0.0` redraw in the Marsaglia-Tsang loop in `gamma_sample`,
+so the flag workaround this entry describes was never written.
+
 **Used by:** `src/dist.tw` (`gamma_sample`, the Marsaglia-Tsang rejection loop;
 `multinomial_sample`, the exhausted-trials case)
 **Status:** not implemented. Duplicates twill NEEDS-12, and loom's entry 14.
@@ -154,6 +207,10 @@ function whose correctness is the reason the beta, the Dirichlet and the
 student t are correct.
 
 ### 9. Recursion, and a depth that reaches 10
+
+**Delivered.** `src/nuts.tw`'s `build_tree` recurses and `tests/nuts_test.tw`
+passes, so the depth reaches at least `max_depth`. The recursive formulation
+was kept.
 
 **Used by:** `src/nuts.tw` (`build_tree` calls itself), `src/dist.tw`
 (`gamma_sample` calls itself once for the shape-below-one boost)
@@ -170,9 +227,12 @@ explicit stack of partially built sub-trees and the merge order becomes
 implicit. Given that the termination condition is the part everyone gets wrong,
 readability here is worth more than it usually is.
 
-## Blocking: features the source assumes exist
+## Delivered: features the source assumed exist, and does
 
 ### 10. `F64` scalar math in systems mode
+
+**Delivered.** All of them, and `f64_pow` takes a negative exponent:
+`src/adapt.tw`'s `m^-kappa` and `src/advi.tw`'s `n^-1/2` both run.
 
 **Needs:** `f64_sqrt`, `f64_log`, `f64_exp`, `f64_pow`, `f64_min`, `f64_of_i64`,
 `i64_of_f64`
@@ -187,6 +247,9 @@ exponents would break both.
 
 ### 11. Struct field mutation through a parameter
 
+**Delivered.** Structs have reference semantics and every accumulator in
+`src/adapt.tw` mutates through its parameter.
+
 **Used by:** `src/adapt.tw` (`dual_avg_update`, `welford_add`, `next_window`),
 `src/nuts.tw` (`merge` writes to `out`), `tests/harness.tw` (`check` and the
 whole counter)
@@ -199,6 +262,9 @@ warmup loop means an allocation per draw per coordinate.
 
 ### 12. `Arr[T]` element assignment
 
+**Delivered.** Delivered and used throughout `src/vec.tw`, `src/hmc.tw`,
+`src/rwm.tw`, `src/advi.tw` and `src/diag.tw`.
+
 **Used by:** `src/vec.tw` (`copy` and the arithmetic), `src/hmc.tw`
 (`leapfrog`, the position update), `src/rwm.tw` (`rwm_draw`, the proposal),
 `src/advi.tw` (the adagrad update), `src/diag.tw` (`sorted_copy`,
@@ -206,6 +272,10 @@ warmup loop means an allocation per draw per coordinate.
 **Status:** duplicates twill NEEDS-43.
 
 ### 13. Integer division and modulo on `I64`
+
+**Delivered.** `/` on two `I64` is integer division.
+`tests/transform_test.tw`'s `the_cholesky_size_counts_the_free_entries` is the
+check that `chol_size` is not off by a half.
 
 **Used by:** `src/diag.tw` (`split_chains`, the halving), `src/transform.tw`
 (`chol_size`), `src/rwm.tw` (the periodic shape refresh)
@@ -216,6 +286,10 @@ division, in a way that produces a parameter vector one element short and a
 shape error a long way from here.
 
 ### 14. `Arr[Arr[F64]]` and `Arr[Chain]`, nested
+
+**Delivered.** Nested containers work. `src/diag.tw` takes `Arr[Arr[F64]]`
+throughout and `tests/diag_test.tw` passes, which requires the chains to have
+stayed apart.
 
 **Used by:** `src/chain.tw` (`Chain.draws`, `columns`), `src/nuts.tw`
 (`run_chains`), `src/diag.tw` (every diagnostic takes `Arr[Arr[F64]]`),
@@ -229,11 +303,16 @@ nesting.
 
 ### 15. `Bool` in an annotation, and an `Arr[Bool]`
 
+**Delivered.** Delivered. `src/chain.tw`'s `Chain.divergent` is an `Arr[Bool]`.
+
 **Used by:** `src/chain.tw` (`Chain.divergent`), `src/nuts.tw` (`Subtree.ok`,
 `Subtree.divergent`), `src/vec.tw` (`all_finite`, `is_finite`)
 **Status:** duplicates twill NEEDS-14.
 
 ### 16. `str()` on an `I64` and an `F64`
+
+**Delivered.** Both. `src/diag.tw`'s `warnings` renders an R-hat into a
+sentence and `tests/diag_test.tw` reads the summary's labels back.
 
 **Used by:** `src/diag.tw` (`warnings`), `src/model.tw` (`declare`,
 `coordinate_names`), `tests/harness.tw`, `examples/eight_schools.tw`
@@ -246,11 +325,18 @@ so the shortest round-tripping form matters more here than in most callers.
 
 ### 17. `Str` concatenation with `+`
 
+**Delivered.** Delivered, and used in `src/diag.tw`, `src/model.tw` and every
+test file.
+
 **Used by:** `src/diag.tw` (`warnings`), `src/model.tw` (`declare`),
 `tests/harness.tw`, `examples/eight_schools.tw`
 **Status:** duplicates twill NEEDS-35 and NEEDS-99.
 
 ### 18. `exit(I64)`
+
+**Delivered.** Delivered, and `tests/harness.tw`'s `report` uses it, so a red
+suite fails CI. `twill test` also reports the failure count itself; see entry
+24.
 
 **Used by:** `tests/harness.tw` (`report`)
 **Status:** duplicates twill NEEDS-28.
@@ -321,6 +407,10 @@ the merge is the function where a missed case is a biased posterior.
 
 ### 21. A tensor `logsumexp` over a systems-mode axis argument
 
+**Delivered.** The axis argument is an `I64` in systems mode.
+`tests/dist_test.tw`'s categorical and multinomial cases pass, which is the
+check.
+
 **Used by:** `src/dist.tw` (`categorical_log_prob`,
 `categorical_log_prob_many`, `multinomial_log_prob`)
 **Status:** `logsumexp(t, axis)` exists in numeric mode and defaults to the last
@@ -332,8 +422,10 @@ falls under entry 2.
 **Needs:** `lgamma` over a `Tensor`, differentiable
 **Used by:** `src/dist.tw` (`lgamma`, `lbeta`, and through them the gamma, beta,
 Dirichlet, student t and multinomial densities)
-**Status:** `std/stats.tw` has `lgamma(x: F64) -> F64`, which is not
-differentiable and therefore not usable here.
+**Status:** still open as of twill 1.7.1. `std/stats.tw` has
+`lgamma(x: F64) -> F64` and nothing in `std` has a tensor `lgamma`; I checked by
+grepping `std/` for `fn lgamma` and `fn digamma`. Not differentiable and
+therefore not usable here.
 
 heddle carries its own Lanczos approximation over tensors. It is about
 twenty lines and it is correct, so this is not a wall. It is duplication of a
@@ -353,8 +445,9 @@ digamma, exactly, which is the point.
 **Used by:** `src/transform.tw` (`softplus`, `log_sigmoid`,
 `log_one_minus_sigmoid`, and through them every unit-interval and simplex
 Jacobian)
-**Status:** `std/nn.tw` has `softplus(x) = log(1.0 + exp(x))`, which is `+inf`
-by x = 710 and has lost all precision by x = -37.
+**Status:** still open as of twill 1.7.1. `std/nn.tw` line 654 is still
+`fn softplus(x) = log(1.0 + exp(x))`, which is `+inf` by x = 710 and has lost
+all precision by x = -37.
 
 Both ends are reached by a real sampler: an unconstrained scale wanders to
 plus or minus 40 routinely during warmup, and an infinity in a Jacobian term
@@ -365,6 +458,11 @@ with no behaviour change for any argument where the current one is finite, so
 this is a correction rather than an addition.
 
 ### 24. A test runner
+
+**Delivered.** `twill test [path ...]` collects every `*_test.tw` under the
+paths given, and it has a `--filter <substring>`. heddle's CI runs `./twill
+test tests` rather than a hand-maintained file list, so a new test file is
+picked up the moment it is added. That was the whole of the ask.
 
 **Needs:** a `twill test` that collects `tests/*_test.tw`
 **Used by:** everything in `tests/`
@@ -381,7 +479,9 @@ someone adds it to the workflow by hand.
 **Needs:** a monotonic millisecond clock
 **Used by:** would be used by `src/nuts.tw` (`run_chain`) to report draws per
 second and to estimate the remaining time
-**Status:** duplicates twill NEEDS-39, and loom's entry 16.
+**Status:** still open as of twill 1.7.1. The builtin set has the memory
+counters, the filesystem and path calls, `env` and `args`, and no clock of any
+kind. Duplicates twill NEEDS-39, and loom's entry 16.
 
 A NUTS run takes minutes to hours and reports nothing while it runs. The useful
 number is not elapsed time but the ratio of gradient evaluations to draws, which
@@ -393,8 +493,12 @@ how long they took.
 
 **Needs:** some way to run four `run_chain` calls at once
 **Used by:** `src/nuts.tw` (`run_chains`)
-**Status:** not designed anywhere. `docs/self-hosting.md` mentions threads only
-as something the native core has.
+**Status:** still open as of twill 1.7.1. Not designed anywhere, and there is
+no process, thread or spawn builtin. `docs/self-hosting.md` mentions threads
+only as something the native core has.
+
+This is the reason `tests/nuts_test.tw` and `tests/diag_test.tw` dominate the
+test suite's wall clock. `README.md` carries the measured numbers.
 
 Four chains are the standard because R-hat needs several, and they are perfectly
 independent: separate seeds, separate state, no shared mutable anything. This is

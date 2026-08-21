@@ -2,8 +2,11 @@
 
 ## 0.1.0
 
-Unreleased, and unrunnable. heddle is written in twill's `mode systems`, which
-is still landing, so nothing here has executed.
+Unreleased, and it runs. heddle is written in twill's `mode systems`, which
+landed in twill 1.6; `twill test tests` passes all 8 suites under twill 1.7.1.
+This entry used to say nothing here had executed, which is no longer true.
+`README.md`'s State table says which piece each suite covers, and which two
+pieces still have no test.
 
 Written:
 
@@ -31,7 +34,11 @@ Written:
 - Tests in the harness spool and loom share, and `examples/eight_schools.tw` in
   both parameterisations.
 
+- A Laplace approximation: Newton to the mode, the Gaussian from `hessian`, the
+  log evidence, sampling and the delta method.
+
 Not written, and why: see the last section of `README.md`.
 
-The list of language features this source needs and twill does not have is
-`docs/needs.md`. It is the useful output of this repository today.
+`docs/needs.md` is the list of language features this source asked twill for. It
+now records which arrived and which are still open, and the open ones are 19,
+22, 23, 25, 26 and 27.
