@@ -30,9 +30,45 @@ twill on every push rather than gating on the prose in this file.
 twill test tests
 ```
 
-You need twill 1.7.0 or newer. `docs/needs.md` is still worth reading -- it
-is the list of what this library asked the language for, and it now records
-which of those arrived and which are still open.
+You need twill 1.7.0 or newer.
+
+### That command takes about sixteen minutes. It is not hung.
+
+This is the thing about heddle worth knowing before anything else. `twill test
+tests` prints nothing about a suite until that suite finishes, and two of the
+eight do real Monte Carlo work: `tests/nuts_test.tw` runs NUTS on five targets
+and `tests/diag_test.tw` builds long chains to check R-hat and ESS against. A
+first-time reader watches a silent terminal for a quarter of an hour and
+concludes the compiler has locked up. It has not.
+
+Measured on Windows 11 against the twill 1.7.1 release binary, `time` around the
+whole run:
+
+| Invocation | Suites | Wall clock |
+| --- | --- | --- |
+| `twill test tests` | 8 | 16m01s |
+| `twill test tests/advi_test.tw tests/dist_test.tw tests/hmc_test.tw tests/laplace_test.tw tests/model_test.tw tests/transform_test.tw` | 6 | 10.2s |
+| `twill test tests --filter diag` | 1 | 1m16.8s |
+| `twill test tests --filter nuts` | 1 | 11m56.9s |
+| `twill test tests --filter laplace` | 1 | 0.2s |
+
+The six fast suites are the second row and they are the ones to run while you
+work: ten seconds for the whole of the library except the two suites above.
+`twill test` takes explicit file paths, which is how that row is written.
+
+`--filter <substring>` runs the suites whose path contains the substring, and it
+takes one substring: passing `--filter` twice keeps only the last one, so it
+selects a suite rather than a set. Explicit paths are the way to name a set.
+
+Nothing here is optimised and nothing here is parallel. `src/nuts.tw`'s
+`run_chains` runs its chains one after another because twill has no way to run
+them at once, which is `docs/needs.md` entry 26 and the largest performance item
+in this repository. There is also no progress output, because twill has no
+clock, which is entry 25.
+
+`docs/needs.md` is still worth reading -- it is the list of what this library
+asked the language for, and it now records which of those arrived and which are
+still open.
 
 ## Why this package is the argument for twill
 
@@ -89,30 +125,48 @@ reparameterisation for it to work.
 
 ## State
 
+Every "runs" below names the test or example that exercises it. A piece with
+no test under `tests/` and no caller in `examples/` says so instead, because
+"it compiles" is not a claim about behaviour.
+
 | Piece | State |
 | --- | --- |
-| A model as `fn(Tensor) -> Tensor`, gradient from `grad` | written, unrun |
-| Distributions: normal, half-normal, lognormal, student t, exponential | written, unrun |
-| Distributions: gamma, beta, dirichlet, categorical, multinomial | written, unrun |
-| Multivariate normal, Cholesky parameterised, differentiable in the factor | written, unrun |
-| Reparameterised forms where one exists, and a plain statement where none does | written, unrun |
-| Transforms: log, logit, interval, stick-breaking, ordered, Cholesky | written, unrun |
-| Every transform's log Jacobian, derived in the source | written, unrun |
-| Random walk Metropolis, with a Robbins-Monro proposal scale | written, unrun |
-| Static HMC, as a reference the tree can be checked against | written, unrun |
-| NUTS: multinomial sampling, generalised U-turn, dual averaging, diagonal mass | written, unrun |
-| Mean-field ADVI with the reparameterisation trick | written, unrun |
-| Laplace approximation: Newton to the mode, Gaussian from the Hessian | written, unrun |
-| Diagnostics: split rank-normalised R-hat, ESS, MCSE, divergences | written, unrun |
+| A model as `fn(Tensor) -> Tensor`, gradient from `grad` | runs; `tests/model_test.tw` checks the value and the gradient together |
+| Distributions: normal, half-normal, lognormal, student t | runs; `tests/dist_test.tw` |
+| Distributions: exponential | written, untested. Nothing under `tests/` or `examples/` calls `exponential_log_prob` |
+| Distributions: gamma, beta, dirichlet, categorical, multinomial | runs; `tests/dist_test.tw`, the densities and the gamma, Dirichlet and multinomial samplers |
+| Multivariate normal, Cholesky parameterised, differentiable in the factor | runs; `tests/dist_test.tw` checks the gradient reaches the factor |
+| Reparameterised forms where one exists, and a plain statement where none does | written, untested. No `_reparam` function is called from `tests/` or `examples/`; ADVI writes the trick out inline rather than calling one |
+| Transforms: log, logit, interval, stick-breaking, ordered, Cholesky | runs; `tests/transform_test.tw` |
+| Every transform's log Jacobian, derived in the source | runs; `tests/transform_test.tw` checks each against a numerical determinant of the forward map |
+| Random walk Metropolis, with a Robbins-Monro proposal scale | runs; exercised through `tests/nuts_test.tw`, which uses it as the reference sampler |
+| Static HMC, as a reference the tree can be checked against | runs; `tests/hmc_test.tw` |
+| NUTS: multinomial sampling, generalised U-turn, dual averaging, diagonal mass | runs; `tests/nuts_test.tw` |
+| Mean-field ADVI with the reparameterisation trick | runs; `tests/advi_test.tw` |
+| Laplace approximation: Newton to the mode, Gaussian from the Hessian | runs; `tests/laplace_test.tw`, and `examples/logistic_laplace.tw` end to end |
+| Diagnostics: split rank-normalised R-hat, ESS, MCSE, divergences | runs; `tests/diag_test.tw` |
 | Dense mass matrix, Riemannian HMC | **not in v0.1** |
 | Discrete parameters and their marginalisation | **not in v0.1** |
-| Anything running end to end | **no** |
+| Anything running end to end | yes, for Laplace: `twill run examples/logistic_laplace.tw` exits 0 in about half a second. The NUTS example is the slow one; see below |
 
-## What it will feel like
+## What a NUTS run looks like
 
 Eight schools, the standard first hierarchical model, in its non-centred
 parameterisation. `examples/eight_schools.tw` is this program complete, with the
 centred version beside it for comparison.
+
+**Read this before you run it.** `examples/eight_schools.tw` is four NUTS chains
+of 1000 warmup and 2000 sampling draws each, run one after another, and it does
+not finish quickly. I ran `twill run examples/eight_schools.tw` under twill
+1.7.1 on Windows 11 and killed it at a 180 second timeout, still running. I did
+not measure how long it actually takes, so I will not put a number on it. It is
+not hung; it is a NUTS run with no progress output, which is `docs/needs.md`
+entry 25. heddle's CI checks this file and does not run it, on purpose.
+
+The transcript below is illustrative and is **not** captured output. I have not
+run this example to completion, so the figures in it are what the summary table
+looks like rather than numbers heddle produced. The only pasted output in this
+README that I measured is the Laplace example under Getting started.
 
 ```rust
 mode systems
@@ -371,16 +425,64 @@ src/hmc.tw          the leapfrog, the Hamiltonian, static HMC
 src/nuts.tw         tree doubling, the U-turn criterion, the run loop
 src/rwm.tw          random walk Metropolis, the reference sampler
 src/advi.tw         mean-field ADVI
+src/laplace.tw      Newton to the mode, the Gaussian from the Hessian
 src/diag.tw         R-hat, ESS, MCSE, divergences, the summary
 src/chain.tw        what a sampler returns
 tests/              tests, named as sentences
-examples/           eight schools, both parameterisations
-docs/needs.md       what the language still has to provide
+examples/           logistic regression by Laplace; eight schools, both
+                    parameterisations
+docs/needs.md       what the language asked for, and what arrived
 ```
 
-## Install
+## Getting started
 
-Once spool and `mode systems` both work:
+Get a twill. The releases carry a single static binary per platform, named
+`twill-v1.7.1-<os>-<arch>`, with assets `linux-amd64`, `linux-arm64`,
+`darwin-amd64`, `darwin-arm64` and `windows-amd64.exe`:
+
+```bash
+curl -fsSL -o twill   https://github.com/twill-lang/twill/releases/download/v1.7.1/twill-v1.7.1-linux-amd64
+chmod +x twill
+./twill --version        # Twill 1.7.1
+```
+
+Then run the fast example. It is Bayesian logistic regression by Laplace
+approximation, and it finishes in under a second:
+
+```bash
+twill run examples/logistic_laplace.tw
+```
+
+That is the whole of the output, captured from that command under twill 1.7.1:
+
+```
+Bayesian logistic regression by Laplace approximation
+converged: true in 7 Newton steps
+
+posterior mode, plus or minus one marginal standard deviation:
+  intercept  -0.101148 +- 1.117369
+  weight 1   2.01338 +- 1.185424
+  weight 2   1.497331 +- 1.156241
+
+log evidence: -3.089811
+  the Laplace approximation to log p(data), for comparing models
+
+predicted P(class one) by sampling 4000 posterior weights, mean +- sd:
+  deep in class zero  0.049732 +- 0.109556
+  deep in class one   0.940989 +- 0.123488
+  on the boundary     0.480165 +- 0.224906
+  the boundary point's wider band is the uncertainty a point estimate hides
+
+the same predictions by the delta method, analytic, no sampling:
+  deep in class zero  0.009771 +- 0.021463
+  deep in class one   0.988065 +- 0.025824
+  on the boundary     0.474735 +- 0.278629
+```
+
+The other example, `examples/eight_schools.tw`, is a NUTS run and does not
+finish quickly. Read the warning above it before starting it.
+
+To use heddle from your own project:
 
 ```
 spool add heddle https://github.com/twill-lang/heddle
@@ -393,12 +495,22 @@ project root. That is twill's rule rather than heddle's; see spool's README.
 ## Dependencies
 
 twill, and nothing else. No third-party twill packages. `std/random` for the
-seeded generator, `std/nn` for `softplus`, and the tensor builtins are the whole
-surface heddle builds on. `std/stats.tw` is deliberately **not** used for
-`lgamma`: a shape parameter is a parameter, so its log gamma has to be
-differentiable, and an `F64` function is a constant to `grad`. `src/dist.tw`
-carries a tensor Lanczos approximation for that reason, and the reason is in the
-source.
+seeded generator, `std/linalg` for the Cholesky and the triangular solves in
+`src/dist.tw` and `src/laplace.tw`, and the tensor builtins are the whole
+surface heddle builds on.
+
+Two standard library functions are deliberately **not** used, and heddle carries
+its own of each:
+
+- `std/stats.tw`'s `lgamma`. A shape parameter is a parameter, so its log gamma
+  has to be differentiable, and an `F64` function is a constant to `grad`.
+  `src/dist.tw` carries a tensor Lanczos approximation for that reason, and
+  `tests/dist_test.tw` checks it against the known factorials and checks that
+  its gradient is the digamma.
+- `std/nn.tw`'s `softplus`, which is the naive `log(1.0 + exp(x))` and overflows.
+  `src/transform.tw` carries the stable form, and
+  `tests/transform_test.tw` checks it does not overflow at a large argument.
+  `docs/needs.md` entry 23 is the request to fix the one in `std/nn.tw`.
 
 ## What was left out, and why
 
@@ -419,10 +531,12 @@ source.
   correct answer is to marginalise them out inside the model, which the user can
   already do with `logsumexp`, and the wrong answer is a Gibbs step bolted onto
   NUTS that quietly breaks the invariance the whole sampler rests on.
-- **A `Distribution` type with `log_prob` and `sample` as fields.** It needs
-  function values in struct fields, which twill does not have yet, and it would
-  buy nothing: no code here dispatches over a distribution at runtime, because
-  the model writer names it at the call site.
+- **A `Distribution` type with `log_prob` and `sample` as fields.** twill has
+  function values in struct fields, so this is possible rather than blocked; I
+  checked by compiling a struct with an `fn(F64) -> F64` field under twill
+  1.7.1 and calling through it. It is left out because it would buy nothing: no
+  code here dispatches over a distribution at runtime, because the model writer
+  names it at the call site. `docs/needs.md` entry 4 is updated to say so.
 
 ## Contributing
 
